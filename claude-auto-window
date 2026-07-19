@@ -130,26 +130,33 @@ _caw_resolve_token() {
     [[ -n "$suffix" ]] && blobs+=( "$(security find-generic-password -s "Claude Code-credentials-$suffix" -a "$USER" -w 2>/dev/null)" )
     [[ "$dir" == "$HOME/.claude" ]] && blobs+=( "$(security find-generic-password -s "Claude Code-credentials" -a "$USER" -w 2>/dev/null)" )
   fi
-  local token="" best=-1 now_ms=$(( $(date +%s) * 1000 )) blob cand exp
+  local token="" best=-1 now_ms=$(( $(date +%s) * 1000 )) blob cand exp expired_only=0
   for blob in "${blobs[@]}"; do
     [[ -z "$blob" ]] && continue
     cand="$(jq -r '.claudeAiOauth.accessToken // empty' <<< "$blob" 2>/dev/null)"
     [[ -z "$cand" ]] && continue
     exp="$(jq -r '.claudeAiOauth.expiresAt // empty' <<< "$blob" 2>/dev/null)"
-    [[ -n "$exp" ]] && (( exp <= now_ms )) && continue     # expired
+    [[ -n "$exp" ]] && (( exp <= now_ms )) && { expired_only=1; continue }  # expired
     [[ -z "$exp" ]] && exp=$now_ms                          # unknown expiry: usable, lowest priority
     (( exp > best )) && { best=$exp; token="$cand"; }
   done
   [[ -n "$token" ]] && { print -r -- "$token"; return 0; }
+  # 4 = credentials exist but every access token has expired (access tokens live
+  # ~8h; only a real claude launch refreshes them, via the stored refresh token).
+  # Distinct from 1 (no credentials at all) so callers can fall through to firing
+  # the starter — which refreshes the token as a side effect of sending.
+  (( expired_only )) && return 4
   return 1
 }
 
 # Fresh raw usage JSON for a profile dir. Non-zero (and no output) on any
-# failure (no token / network / API error) so callers fall through to "unknown".
+# failure so callers fall through to "unknown" — except 4 (access token expired,
+# see _caw_resolve_token), which is propagated so callers can distinguish
+# "can't authenticate until something sends" from network/API errors.
 _caw_usage_json() {
   emulate -L zsh
-  local dir="$1" token resp
-  token="$(_caw_resolve_token "$dir")" || return 3
+  local dir="$1" token resp rc
+  token="$(_caw_resolve_token "$dir")" || { rc=$?; (( rc == 4 )) && return 4; return 3; }
   resp="$(curl -s --connect-timeout 3 --max-time 6 \
     "https://api.anthropic.com/api/oauth/usage" \
     -H "Authorization: Bearer $token" \
@@ -163,7 +170,12 @@ _caw_usage_json() {
 
 # Is a five-hour window currently open?
 #   0 = open, 1 = closed, 2 = account has NO 5h window (API/usage-billed seat —
-#   nothing to keep open), 3 = could not determine
+#   nothing to keep open), 3 = could not determine (network/API error),
+#   4 = access token expired — state is unknowable until a claude launch
+#   refreshes it, and the starter itself does exactly that, so callers should
+#   treat this as "proceed to fire", not as an error. (This 4 is internal to
+#   the session-check path; it is unrelated to the public exit code 4 =
+#   "starter sent but no reply" from _caw_send_starter.)
 #
 # "Open" is decided SOLELY by `resets_at` being in the FUTURE. We deliberately do
 # NOT consult the endpoint's `is_active` flag: it tracks *recent activity* (reads
@@ -176,8 +188,8 @@ _caw_usage_json() {
 # (It also self-documents which subscription the opaque <hash>.state belongs to.)
 _caw_session_active() {
   emulate -L zsh
-  local dir="$1" json has sess resets now
-  json="$(_caw_usage_json "$dir")" || return 3
+  local dir="$1" json has sess resets now rc
+  json="$(_caw_usage_json "$dir")" || { rc=$?; (( rc == 4 )) && return 4; return 3; }
   [[ -n "$json" ]] || return 3
   # Does this account use the 5-hour session-window model at all? Pro/Max do;
   # API/usage-billed (Team/Enterprise/console) seats return no session limit.
@@ -216,6 +228,9 @@ _caw_status_line() {
   _caw_session_active "$dir"; rc=$?
   if (( rc == 3 )); then
     _caw_log ERROR "usage lookup failed for $dir"; return 1
+  elif (( rc == 4 )); then
+    print -r -- "profile=$dir five_hour=? (access token expired — --once/the daemon self-heal it with a bare claude launch; any claude use also refreshes it)"
+    return 0
   elif (( rc == 2 )); then
     print -r -- "profile=$dir five_hour=n/a (no session window — API/usage-billed account?)"
     return 0
@@ -551,6 +566,78 @@ _caw_quit_and_kill() {
   tmux -L "$sock" kill-session -t "$sess" 2>/dev/null
 }
 
+# Self-heal an expired access token WITHOUT spending anything: launch a bare
+# interactive claude in the same throwaway tmux — with NO prompt argument, so
+# nothing is ever sent, no 5-hour window is opened, and no usage is spent — and
+# wait for the stored credential to turn fresh. The CLI refreshes the access
+# token (via the stored refresh token) on its first authenticated backend call
+# at startup, typically within seconds; verified empirically 2026-07-20 (see
+# AGENTS.md → Gotchas). Then tear the session down like a normal starter.
+#   0 = token is fresh now, non-zero = it never turned fresh (most likely the
+#   refresh token has expired too — >~3 days idle — which needs a manual login).
+_caw_refresh_token() {
+  emulate -L zsh
+  local dir="$1" claude_bin starter_dir sock sess uuid pane
+  local timeout="${CLAUDE_AUTO_WINDOW_REFRESH_TIMEOUT_SECONDS:-45}"
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_REFRESH_TIMEOUT_SECONDS "$timeout" || return $?
+  claude_bin="$(_caw_resolve_claude_bin)" || return $?
+  command -v tmux >/dev/null 2>&1 || { _caw_log ERROR "tmux not found on PATH"; return 2; }
+
+  # Same stable starter dir + isolated socket as _caw_send_starter (one trust
+  # entry, never the user's real tmux server).
+  starter_dir="${CLAUDE_AUTO_WINDOW_STARTER_DIR:-${${TMPDIR:-/tmp}%/}/claude-auto-window-${UID}}"
+  sock="${CLAUDE_AUTO_WINDOW_TMUX_SOCKET:-claude-auto-window}"
+  mkdir -p "$starter_dir" || { _caw_log ERROR "cannot create starter dir: $starter_dir"; return 1; }
+  sess="caw-refresh-$$-$(date +%s)-${RANDOM}"
+  uuid="$(_caw_uuid)"
+
+  # Same launch shape as the starter (API-key strip, profile pinning, LIGHT
+  # context stripping, pinned session id) — minus the prompt and the model:
+  # with nothing to send, there is nothing to bill and no model to pick.
+  local -a launch
+  launch=( env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_SKIP_PROMPT_HISTORY=1 )
+  _caw_launch_profile_pinned && launch+=( "CLAUDE_CONFIG_DIR=$dir" )
+  launch+=( "$claude_bin" )
+  if [[ "${CLAUDE_AUTO_WINDOW_LIGHT:-1}" == 1 ]]; then
+    launch+=( --safe-mode --tools "" --exclude-dynamic-system-prompt-sections )
+  fi
+  [[ -n "$uuid" ]] && launch+=( --session-id "$uuid" )
+  local paneline="cd ${(q)starter_dir} && exec ${(j: :)${(@q)launch}}"
+
+  _caw_log INFO "Token refresh: launching a bare claude session '$sess' (no prompt — nothing is sent or spent)"
+  if ! tmux -L "$sock" new-session -d -s "$sess" -x 220 -y 50 "$paneline" 2>/dev/null; then
+    _caw_log ERROR "failed to create tmux session"
+    return 1
+  fi
+
+  {
+    local deadline=$(( $(date +%s) + timeout )) trusted=0
+    local -a trust_keys=( ${=CLAUDE_AUTO_WINDOW_TRUST_KEYS:-Enter} )
+    while (( $(date +%s) < deadline )); do
+      if _caw_resolve_token "$dir" >/dev/null; then
+        _caw_log INFO "Access token refreshed by the launch"
+        return 0
+      fi
+      tmux -L "$sock" has-session -t "$sess" 2>/dev/null || break   # crash/early exit
+      # First run in a new starter dir: accept the trust dialog, same as the starter.
+      if (( ! trusted )); then
+        pane="$(tmux -L "$sock" capture-pane -p -t "$sess" 2>/dev/null)"
+        if print -r -- "$pane" | grep -qiE 'trust the files in this folder|Do you trust|Yes, (proceed|I trust)' 2>/dev/null; then
+          _caw_log INFO "Accepting workspace-trust dialog for the starter dir"
+          tmux -L "$sock" send-keys -t "$sess" "${trust_keys[@]}" 2>/dev/null
+          trusted=1
+        fi
+      fi
+      sleep 2
+    done
+    _caw_log WARN "token did not refresh within ${timeout}s — the refresh token has likely expired too (>~3 days without Claude activity); a manual claude session / login is needed"
+    return 1
+  } always {
+    _caw_quit_and_kill "$sock" "$sess"
+    _caw_cleanup_transcript "$dir" "$uuid"
+  }
+}
+
 # Send exactly one interactive starter.
 #   $1 = check dir, $2 = show output (1/0), $3 = model (optional; "" = account
 #   default / no --model). When $3 is omitted, CLAUDE_AUTO_WINDOW_MODEL is used
@@ -684,8 +771,9 @@ claude-auto-window-run() {
   {
     # The only guard in --run: refuse if this account has NO 5-hour window at all
     # (usage-billed/API seat), since firing there just spends money for nothing.
-    # Fail-open on everything else (active/closed/undetermined) so --run stays the
-    # "just do it" path. --force / CLAUDE_AUTO_WINDOW_FORCE=1 bypasses even this.
+    # Fail-open on everything else (active/closed/undetermined/token-expired) so
+    # --run stays the "just do it" path (an expired access token is refreshed by
+    # the launch itself). --force / CLAUDE_AUTO_WINDOW_FORCE=1 bypasses even this.
     if [[ "${CLAUDE_AUTO_WINDOW_FORCE:-0}" != 1 ]]; then
       _caw_session_active "$dir"; rc=$?
       if (( rc == 2 )); then
@@ -738,6 +826,22 @@ claude-auto-window-once() {
     fi
 
     _caw_session_active "$dir"; rc=$?
+    if (( rc == 4 )); then
+      # Access token expired (>8h without a claude launch). This is NOT the
+      # rc-3 hard-fail — it's self-healable with zero spend: a bare claude
+      # launch (no prompt) refreshes the token within seconds, so do that and
+      # re-run the state check with the fresh token. Only if the refresh
+      # launch itself fails do we fall through on rc 4 to firing a starter
+      # blind — the send also refreshes, worst case it costs one tiny message
+      # inside an already-open window, and if the refresh token has expired
+      # too (>~3 days idle) the no-reply trips the circuit breaker.
+      _caw_log INFO "Access token expired — self-healing with a bare claude launch, then re-checking"
+      if _caw_refresh_token "$dir"; then
+        _caw_session_active "$dir"; rc=$?
+      else
+        _caw_log WARN "Self-heal launch did not refresh the token; falling back to firing a starter blind"
+      fi
+    fi
     if (( rc == 0 )); then
       _caw_breaker_reset "$dir"         # window confirmed open → healthy, clear the counter
       _caw_log INFO "Window already open for $dir; nothing to do"
@@ -748,6 +852,8 @@ claude-auto-window-once() {
     elif (( rc == 3 )); then
       _caw_log ERROR "Could not determine window state for $dir"
       return 1
+    elif (( rc == 4 )); then
+      _caw_log INFO "Proceeding to fire the starter (its send refreshes the token; visibility returns next cycle)"
     fi
 
     # Endpoint-lag guard: the usage endpoint takes a few minutes to reflect a

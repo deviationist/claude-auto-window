@@ -64,10 +64,21 @@ Claude Code uses itself. It's read per config-dir:
   Claude Code namespaces multiple accounts. The first read may prompt for Keychain
   access; click **Always Allow** once.
 
-The freshest non-expired token is used. Claude Code refreshes tokens itself; if
-all stored tokens are expired, run a Claude Code session for that account to
-refresh, then retry. No `ANTHROPIC_API_KEY` is involved (the starter explicitly
-strips it so the subscription login is used).
+The freshest non-expired token is used. Access tokens live ~8 hours and only a
+real `claude` launch refreshes them (via the stored refresh token, itself valid
+for ~3 days) — so after >8h without any Claude activity the stored token is
+expired and the window check can't authenticate. That's fine — the checked
+paths **self-heal**: `--once` and the daemon detect the expired token locally,
+launch a bare `claude` session with **no prompt** in the usual throwaway tmux
+(nothing is sent, no window is opened, nothing is spent — the CLI refreshes the
+token at startup, within seconds), tear it down, and re-run the window check
+with the fresh token. Only if that refresh launch fails do they fall back to
+firing a starter directly (whose send also refreshes). After several days of
+total inactivity the refresh token expires too — then the self-heal can't work,
+the starter gets no reply, the circuit breaker catches it, and a manual Claude
+Code session / `/login` for that account resolves it. No `ANTHROPIC_API_KEY`
+is involved (the starter explicitly strips it so the subscription login is
+used).
 
 ## Install
 
