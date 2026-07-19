@@ -1,0 +1,12 @@
+# Local logs / state
+*.log
+/state/
+
+# Real env files (only the .example is tracked)
+*.env
+!*.env.example
+
+# macOS / editor cruft
+.DS_Store
+*.swp
+*~

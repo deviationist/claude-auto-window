@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd LaunchAgent for claude-auto-window (the "daemon" on macOS).
+
+  launchd requires absolute paths and does not expand ~ or env vars in
+  ProgramArguments, so the two __HOME__ placeholders below must be replaced with
+  your real home directory. The README shows a one-liner that does this for you;
+  the manual path is:
+
+    mkdir -p ~/.local/state/claude-auto-window
+    sed "s|__HOME__|$HOME|g" claude-auto-window.plist > ~/Library/LaunchAgents/claude-auto-window.plist
+    launchctl load ~/Library/LaunchAgents/claude-auto-window.plist
+    # logs: ~/.local/state/claude-auto-window/launchd.log
+    # stop: launchctl unload ~/Library/LaunchAgents/claude-auto-window.plist
+
+  KeepAlive restarts the daemon if it dies; the daemon does its own interval
+  polling, so no StartInterval is needed. To run as a periodic (cron-like) job
+  instead, drop KeepAlive, change --daemon to --once, and add
+  <key>StartInterval</key><integer>300</integer>.
+
+  Change --profile default to target another Claude profile (see README).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>claude-auto-window</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__HOME__/.local/bin/claude-auto-window</string>
+    <string>--daemon</string>
+    <string>--profile</string>
+    <string>default</string>
+    <string>--log</string>
+    <string>__HOME__/.local/state/claude-auto-window/default.log</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS</key>
+    <string>300</string>
+    <key>CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS</key>
+    <string>180</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/.local/state/claude-auto-window/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.local/state/claude-auto-window/launchd.log</string>
+</dict>
+</plist>

@@ -1,0 +1,49 @@
+# systemd --user template unit for claude-auto-window.
+#
+# Template: the instance name (%i) is the profile to keep a window open for.
+#   default  → let Claude Code resolve ~/.claude (no CLAUDE_CONFIG_DIR)
+#   personal → ~/.claude-personal
+#   work     → ~/.claude
+#   or an absolute path to any Claude profile dir
+#
+# Install (Linux, systemd --user):
+#   mkdir -p ~/.config/systemd/user ~/.config/claude-auto-window ~/.local/state/claude-auto-window
+#   ln -sf /path/to/repo/claude-auto-window ~/.local/bin/claude-auto-window
+#   cp claude-auto-window@.service ~/.config/systemd/user/
+#   cp claude-auto-window.env.example ~/.config/claude-auto-window/default.env   # then edit
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now claude-auto-window@default.service
+#   # a second account/profile, side by side:
+#   systemctl --user enable --now claude-auto-window@personal.service
+#
+# Headless server (no persistent login session): enable lingering so the --user
+# manager runs at boot without anyone logged in:
+#   sudo loginctl enable-linger "$USER"
+#
+# journalctl --user -u claude-auto-window@default -f   # follow logs
+
+[Unit]
+Description=Claude five-hour auto-window keeper (%i)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# tmux + claude usually live in user-local / npm bins that aren't on the stock
+# service PATH — make them reachable.
+Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS=300
+Environment=CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS=180
+# Per-instance overrides (optional). "-" = tolerate a missing file.
+EnvironmentFile=-%h/.config/claude-auto-window/%i.env
+ExecStart=%h/.local/bin/claude-auto-window --daemon --profile %i --log %h/.local/state/claude-auto-window/%i.log
+Restart=on-failure
+RestartSec=15s
+TimeoutStopSec=30s
+KillMode=control-group
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=default.target
