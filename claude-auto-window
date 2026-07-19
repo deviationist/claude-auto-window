@@ -170,13 +170,12 @@ _caw_usage_json() {
 # false on an open-but-idle window) and adds no coverage resets_at doesn't already
 # give — and worse, a lingering `is_active` on a *past* resets_at could falsely
 # read "open". resets_at is the one signal.
-# On a confirmed-open return (0), this also exports _CAW_RESET_AT (the future
-# reset timestamp, for the daemon's adaptive sleep) and records profile +
-# resets_at in the per-profile state file (self-documents which subscription the
-# opaque <hash>.state belongs to; supports multi-profile setups).
+# On a confirmed-open return (0), this records profile + resets_at in the
+# per-profile state file. That stored resets_at is the single source of truth for
+# "when to act next": both the --once early-exit and the daemon's sleep read it.
+# (It also self-documents which subscription the opaque <hash>.state belongs to.)
 _caw_session_active() {
   emulate -L zsh
-  typeset -g _CAW_RESET_AT=""
   local dir="$1" json has sess resets now
   json="$(_caw_usage_json "$dir")" || return 3
   [[ -n "$json" ]] || return 3
@@ -192,7 +191,6 @@ _caw_session_active() {
   # fixed-width YYYY-MM-DDTHH:MM:SS prefix is a correct chronological compare.
   now="$(date -u +%Y-%m-%dT%H:%M:%S)"
   if [[ "${resets:0:19}" > "$now" ]]; then                # future → open
-    _CAW_RESET_AT="$resets"
     _caw_state_set "$dir" profile "$dir"
     _caw_state_set "$dir" resets_at "$resets"
     return 0
@@ -714,6 +712,19 @@ claude-auto-window-once() {
   (( jitter_min > jitter_max )) && jitter_max=$jitter_min   # clamp: keep min <= max
   dir="$(_caw_check_dir)"
 
+  # If we already know when to act next — a stored resets_at that hasn't passed —
+  # exit early WITHOUT hitting the endpoint. This is what lets a per-minute cron
+  # cost almost nothing: it only fetches near expiry and during the post-open
+  # confirm phase (when the stored resets_at is the old, now-past value).
+  local _sr _sre
+  if _sr="$(_caw_state_get "$dir" resets_at)" && [[ -n "$_sr" ]]; then
+    _sre="$(_caw_iso_to_epoch "$_sr")"
+    if [[ "$_sre" == <-> ]] && (( $(date +%s) < _sre )); then
+      _caw_log INFO "Window open until $_sr — not due yet, exiting"
+      return 0
+    fi
+  fi
+
   lock="$(_caw_acquire_lock "$dir")"; rc=$?
   (( rc == 75 )) && return 0     # someone else has it; nothing to do
   (( rc != 0 )) && return "$rc"
@@ -802,14 +813,15 @@ Re-enable with:  claude-auto-window --reset
   }
 }
 
-# Daemon: run the guarded cycle, then sleep ADAPTIVELY instead of polling on a
-# fixed cadence. When a window is open we know exactly when it ends (resets_at),
-# so we sleep until ~one fine-interval before then — no continuous polling. We
-# only poll at the fine interval in two situations: to confirm a just-opened
-# window (the endpoint lags a few minutes), and to count down the final interval
-# before expiry. A safety cap (MAX_SLEEP) bounds any single sleep.
+# Daemon: run the guarded cycle, then sleep until the window expires instead of
+# polling on a fixed cadence. When a window is open we know exactly when it ends
+# (the stored resets_at), so we sleep until just after that — no polling in
+# between. We only re-check at the fine interval to confirm a just-opened window
+# (the endpoint lags a few minutes). A safety cap (MAX_SLEEP) bounds any single
+# sleep.
 claude-auto-window-daemon() {
   emulate -L zsh
+  local dir; dir="$(_caw_check_dir)"
   local interval="${CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS:-60}"
   _caw_validate_uint CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS "$interval" || return $?
   (( interval >= 1 )) || { _caw_log ERROR "interval must be >= 1"; return 2; }
@@ -825,8 +837,8 @@ claude-auto-window-daemon() {
   local stop=0
   trap 'stop=1' INT TERM HUP
 
-  _caw_log INFO "Daemon up: adaptive sleep (fine poll ${interval}s, max sleep ${maxsleep}s), jitter 0-${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}s"
-  local rc sleep_for reset_epoch now_s
+  _caw_log INFO "Daemon up: sleeps until window expiry (confirm poll ${interval}s, max sleep ${maxsleep}s), jitter ${CLAUDE_AUTO_WINDOW_JITTER_MIN_SECONDS:-0}-${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}s"
+  local rc sleep_for now_s
   while (( ! stop )); do
     claude-auto-window-once; rc=$?
     if (( rc == 2 )); then
@@ -842,19 +854,22 @@ claude-auto-window-daemon() {
       _caw_log WARN "Cycle failed (status $rc); retrying in ${interval}s"
     fi
 
-    # If a window is open with a known reset time, sleep until just AFTER it
-    # expires (resets_at + buffer): the next check then sees it closed and fires,
-    # with no wasted pre-expiry poll. Otherwise poll at the fine interval to
-    # confirm a freshly opened window (the endpoint lags a few minutes).
+    # Read the stored resets_at (single source of truth). If it's in the future,
+    # sleep until just AFTER expiry (+ buffer): the next check then sees it closed
+    # and fires. Otherwise poll at the fine interval to confirm a freshly opened
+    # window (the endpoint lags a few minutes before it reflects the new resets_at).
     sleep_for=$interval
-    if [[ -n "$_CAW_RESET_AT" ]]; then
-      reset_epoch="$(_caw_iso_to_epoch "$_CAW_RESET_AT")"
-      if [[ "$reset_epoch" == <-> ]]; then
+    local sr sre
+    sr="$(_caw_state_get "$dir" resets_at)"
+    if [[ -n "$sr" ]]; then
+      sre="$(_caw_iso_to_epoch "$sr")"
+      if [[ "$sre" == <-> ]]; then
         now_s=$(date +%s)
-        sleep_for=$(( reset_epoch + buffer - now_s ))       # wake just after expiry
-        (( sleep_for < 1 )) && sleep_for=1                  # ~expired already → check now
-        (( sleep_for > maxsleep )) && sleep_for=$maxsleep   # safety cap (clock drift / suspend)
-        _caw_log INFO "Window open until $_CAW_RESET_AT; sleeping ${sleep_for}s (wake ${buffer}s after expiry)"
+        if (( sre > now_s )); then                          # future → sleep to expiry+buffer
+          sleep_for=$(( sre + buffer - now_s ))
+          (( sleep_for > maxsleep )) && sleep_for=$maxsleep # safety cap (clock drift / suspend)
+          _caw_log INFO "Window open until $sr; sleeping ${sleep_for}s (wake ${buffer}s after expiry)"
+        fi
       fi
     fi
     (( stop )) || sleep "$sleep_for" || true
@@ -907,7 +922,7 @@ $XDG_CONFIG_HOME/claude-auto-window/config):
                                                                Default: 60
   --post-expiry SEC        Daemon wakes this long after a window's expiry to fire
                            the next starter.                   Default: 5
-  --max-sleep SEC          Cap on a single adaptive sleep (safety).  Default: 21600
+  --max-sleep SEC          Cap on a single sleep (safety).     Default: 21600
   --jitter-max SEC         Upper bound of the random wait before firing. Keep
                            small on a single daemon for tight windows. Default: 180
   --jitter-min SEC         Lower bound of the random wait before firing. Default: 0

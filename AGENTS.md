@@ -27,14 +27,17 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
   to a mode function.
 - **Modes:**
   - `claude-auto-window-run` — fire immediately, **no checks, no jitter**.
-  - `claude-auto-window-once` *(default)* — check window; if closed, **jitter**
-    then open. Guards: already-open, weekly-exhausted, no-5h-window.
-  - `claude-auto-window-daemon` — loop `-once`, then **sleep adaptively**: if a
-    window is open (`_CAW_RESET_AT` set by `_caw_session_active`), sleep until just
-    AFTER expiry (`resets_at + POST_EXPIRY`, capped at `MAX_SLEEP`) so the next
-    check sees it closed and fires — no wasted pre-expiry poll; else poll every
+  - `claude-auto-window-once` *(default)* — **early-exit gate first**: read the
+    stored `resets_at`; if it's still in the future, return 0 WITHOUT fetching
+    (this is what makes a per-minute cron cheap). Otherwise check the window; if
+    closed, **jitter** then open. Guards: already-open, weekly-exhausted,
+    no-5h-window. Not a flag — always on; `--status` is the live-check escape.
+  - `claude-auto-window-daemon` — loop `-once`, then sleep off the **stored
+    `resets_at`** (single source of truth, written by `_caw_session_active`): if
+    future, sleep until just AFTER expiry (`resets_at + POST_EXPIRY`, capped at
+    `MAX_SLEEP`) so the next check sees it closed and fires; else poll every
     `INTERVAL` to confirm a just-opened window (endpoint lag). No continuous
-    polling. Cron can't do this — it polls on its crontab cadence.
+    polling. Cron can't sleep — it relies on the `-once` early-exit gate instead.
   - `claude-auto-window-status` — print the current session state.
 - **Both `-run` and `-once` open a window via** `_caw_open_window` → which calls
   `_caw_send_starter` and adds the **cheapest-model-with-fallback** retry.
