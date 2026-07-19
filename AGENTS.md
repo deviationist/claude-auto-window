@@ -15,8 +15,7 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
 
 | File | Role |
 |---|---|
-| `claude-auto-window` | The whole tool. Executable **and** source-able. |
-| `claude-usage.zsh` | Bundled OAuth usage reader. Sourced by the script; provides `claude-usage`. The window check lives here, not in the main script. |
+| `claude-auto-window` | The whole tool — one self-contained script (OAuth read + usage fetch inlined). Executable **and** source-able. |
 | `claude-auto-window@.service` | systemd `--user` template (Linux daemon), keyed on profile via `%i`. |
 | `claude-auto-window.plist` | launchd template (macOS daemon), `__HOME__` placeholders. |
 | `claude-auto-window.env.example` | Every `CLAUDE_AUTO_WINDOW_*` knob. |
@@ -37,10 +36,10 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
   new-session` running `claude` directly → `_caw_wait_reply` (also auto-accepts
   the trust dialog) → `_caw_quit_and_kill` → `_caw_cleanup_transcript`, the last
   two in an `always {}` block so teardown is guaranteed.
-- **Window check** is `_caw_session_active` → `_caw_usage_json` →
-  `claude-usage --dir <dir> --fresh --json` → `.limits[] | select(.kind=="session")`.
-  "Open" = **`resets_at` in the future** (or `active:true`), **not** the
-  `active`/`is_active` flag (see Gotchas).
+- **Window check** is `_caw_session_active` → `_caw_usage_json` (inlined:
+  `_caw_resolve_token` + a `curl` to the OAuth usage endpoint → raw JSON) →
+  `.limits[] | select(.kind=="session")`. "Open" = **`resets_at` in the future**;
+  `is_active` is deliberately NOT consulted (see Gotchas).
 
 All private helpers are prefixed **`_caw_`** (claude-auto-window). Public
 functions are the `claude-auto-window*` names.
@@ -114,13 +113,16 @@ per-profile lock.
 
 ## Gotchas
 
-- **Undocumented endpoint.** `claude-usage.zsh` calls
-  `api.anthropic.com/api/oauth/usage`, reverse-engineered from Claude Code. If the
-  schema changes, the `.limits[] … kind=="session"` parse is what to fix.
-- **`is_active`/`active` is NOT "is a window open".** It tracks recent activity,
-  so an open-but-idle window reads `active:false`. The real signal is
-  **`resets_at` in the future**. Keying on `active` was a real bug: the tool
-  reported a window it had just opened as still closed. Don't revert to it.
+- **Undocumented endpoint.** `_caw_usage_json` calls
+  `api.anthropic.com/api/oauth/usage`, reverse-engineered from Claude Code. It
+  returns the **raw** response (not the standalone `claude-usage` CLI's normalized
+  `--json` shape — note the field is `is_active`, not `active`). If the schema
+  changes, the `.limits[] … kind=="session"` parse is what to fix.
+- **`is_active` is NOT "is a window open" — and we don't read it.** It tracks
+  recent activity, so an open-but-idle window reads `is_active:false`. The only
+  signal we use is **`resets_at` in the future**. Keying on `is_active` was a real
+  bug (reported a just-opened window as closed); it was removed entirely. Don't
+  reintroduce it.
 - **The endpoint lags a few minutes** behind reality (and behind claude.ai) after
   a window opens — `resets_at` is briefly `null` before it populates. So: (a) the
   received reply, not the endpoint, is the authoritative success signal (verify is
