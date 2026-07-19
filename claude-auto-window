@@ -13,8 +13,8 @@
 # ../claude-auto-window-old for that Codex-authored variant) — we drive the
 # genuine TUI path through tmux instead.
 #
-# The window check reuses ../claude-usage.zsh (your own OAuth usage reader),
-# so no Anthropic API key is required — Claude Code's existing login is used.
+# The window check reads Claude Code's own OAuth usage endpoint directly (token
+# resolution + fetch are inlined below) — no Anthropic API key required.
 #
 # ---------------------------------------------------------------------------
 # Modes (pick one; --once is the default)
@@ -108,45 +108,71 @@ _caw_resolve_claude_bin() {
 }
 
 # ----------------------------------------------------------------------------
-# Usage-endpoint helpers — reuse ../claude-usage.zsh (your own OAuth reader).
+# Usage endpoint — self-contained OAuth reader. We only need the raw usage JSON
+# for the five-hour window check, so this is deliberately minimal: resolve the
+# token Claude Code stored, GET the endpoint, return the raw response. No caching
+# / display formatting (that belongs in a standalone `claude-usage` CLI; this is
+# a different, programmatic use case).
+#
+# No Anthropic API key is used — the account's own OAuth login is read from
+# <dir>/.credentials.json (Linux) or the macOS Keychain (service
+# "Claude Code-credentials-<8 hex of sha256(abs dir)>", plus the legacy
+# un-suffixed entry for ~/.claude). The freshest non-expired token wins.
 # ----------------------------------------------------------------------------
-_caw_load_usage_lib() {
+_caw_resolve_token() {
   emulate -L zsh
-  typeset -f claude-usage >/dev/null 2>&1 && return 0
-  local here="${${(%):-%x}:A:h}"
-  local -a candidates
-  [[ -n "${CLAUDE_AUTO_WINDOW_USAGE_LIB:-}" ]] && candidates+=( "$CLAUDE_AUTO_WINDOW_USAGE_LIB" )
-  candidates+=( "$here/claude-usage.zsh" "$here/../claude-usage.zsh" )   # bundled sibling, then dotfiles layout
-  local lib
-  for lib in "${candidates[@]}"; do
-    if [[ -r "$lib" ]]; then
-      source "$lib"
-      typeset -f claude-usage >/dev/null 2>&1 && return 0
-    fi
+  local dir="${1%/}"
+  local -a blobs
+  blobs=( "$(cat "$dir/.credentials.json" 2>/dev/null)" )
+  if command -v security >/dev/null 2>&1; then
+    local suffix
+    suffix="$(printf '%s' "${dir:a}" | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | cut -c1-8)"
+    [[ -n "$suffix" ]] && blobs+=( "$(security find-generic-password -s "Claude Code-credentials-$suffix" -a "$USER" -w 2>/dev/null)" )
+    [[ "$dir" == "$HOME/.claude" ]] && blobs+=( "$(security find-generic-password -s "Claude Code-credentials" -a "$USER" -w 2>/dev/null)" )
+  fi
+  local token="" best=-1 now_ms=$(( $(date +%s) * 1000 )) blob cand exp
+  for blob in "${blobs[@]}"; do
+    [[ -z "$blob" ]] && continue
+    cand="$(jq -r '.claudeAiOauth.accessToken // empty' <<< "$blob" 2>/dev/null)"
+    [[ -z "$cand" ]] && continue
+    exp="$(jq -r '.claudeAiOauth.expiresAt // empty' <<< "$blob" 2>/dev/null)"
+    [[ -n "$exp" ]] && (( exp <= now_ms )) && continue     # expired
+    [[ -z "$exp" ]] && exp=$now_ms                          # unknown expiry: usable, lowest priority
+    (( exp > best )) && { best=$exp; token="$cand"; }
   done
-  _caw_log ERROR "claude-usage.zsh not found (looked in: ${candidates[*]}); set CLAUDE_AUTO_WINDOW_USAGE_LIB"
-  return 3
+  [[ -n "$token" ]] && { print -r -- "$token"; return 0; }
+  return 1
 }
 
-# Fresh normalized usage JSON for a profile dir.
+# Fresh raw usage JSON for a profile dir. Non-zero (and no output) on any
+# failure (no token / network / API error) so callers fall through to "unknown".
 _caw_usage_json() {
   emulate -L zsh
-  local dir="$1"
-  _caw_load_usage_lib || return 3
-  claude-usage --dir "$dir" --fresh --json 2>/dev/null
+  local dir="$1" token resp
+  token="$(_caw_resolve_token "$dir")" || return 3
+  resp="$(curl -s --connect-timeout 3 --max-time 6 \
+    "https://api.anthropic.com/api/oauth/usage" \
+    -H "Authorization: Bearer $token" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "Content-Type: application/json" 2>/dev/null)" || return 3
+  # Validate it's a real usage response, not an error/HTML/empty body.
+  jq -e 'type == "object" and (.error == null) and ((.limits != null) or (.five_hour != null))' \
+    <<< "$resp" >/dev/null 2>&1 || return 3
+  print -r -- "$resp"
 }
 
 # Is a five-hour window currently open?
 #   0 = open, 1 = closed, 2 = account has NO 5h window (API/usage-billed seat —
 #   nothing to keep open), 3 = could not determine
 #
-# IMPORTANT: "open" is decided by `resets_at` being in the FUTURE, not by the
-# endpoint's `active`/`is_active` flag. That flag tracks *recent activity*, so an
-# open-but-idle window reads inactive — keying on it made the tool think a window
-# it had just opened was still closed. We treat either signal as open.
+# "Open" is decided SOLELY by `resets_at` being in the FUTURE. We deliberately do
+# NOT consult the endpoint's `is_active` flag: it tracks *recent activity* (reads
+# false on an open-but-idle window) and adds no coverage resets_at doesn't already
+# give — and worse, a lingering `is_active` on a *past* resets_at could falsely
+# read "open". resets_at is the one signal.
 _caw_session_active() {
   emulate -L zsh
-  local dir="$1" json has sess active resets now
+  local dir="$1" json has sess resets now
   json="$(_caw_usage_json "$dir")" || return 3
   [[ -n "$json" ]] || return 3
   # Does this account use the 5-hour session-window model at all? Pro/Max do;
@@ -155,16 +181,13 @@ _caw_session_active() {
   [[ "$has" == <-> ]] || return 3
   (( has == 0 )) && return 2
   sess="$(jq -c 'first(.limits[]? | select(.kind=="session")) // {}' <<< "$json" 2>/dev/null)"
-  active="$(jq -r '.active // false'  <<< "$sess" 2>/dev/null)"
-  resets="$(jq -r '.resets_at // ""'  <<< "$sess" 2>/dev/null)"
-  [[ "$active" == "true" ]] && return 0
+  resets="$(jq -r '.resets_at // ""' <<< "$sess" 2>/dev/null)"
+  [[ -n "$resets" && "$resets" != "null" ]] || return 1   # no reset time → closed
   # resets_at and `date -u` are both UTC ISO-8601, so a lexical compare of the
   # fixed-width YYYY-MM-DDTHH:MM:SS prefix is a correct chronological compare.
-  if [[ -n "$resets" && "$resets" != "null" ]]; then
-    now="$(date -u +%Y-%m-%dT%H:%M:%S)"
-    [[ "${resets:0:19}" > "$now" ]] && return 0
-  fi
-  return 1
+  now="$(date -u +%Y-%m-%dT%H:%M:%S)"
+  [[ "${resets:0:19}" > "$now" ]] && return 0             # future → open
+  return 1                                                # null / past → closed
 }
 
 # Print a human status line.

@@ -21,9 +21,9 @@ waiting for a new window to start after you hit a limit.
 
 ## How it works
 
-1. **Check** — read the OAuth usage endpoint (via the bundled `claude-usage.zsh`)
-   for the `session` (5h) limit's `active` flag. No API key needed — Claude
-   Code's existing login is used.
+1. **Check** — read Claude Code's OAuth usage endpoint directly for the `session`
+   (5h) limit's `resets_at`. No API key needed — Claude Code's existing login is
+   used (token resolution + fetch are built in; no external dependency).
 2. **Stop if open** — a window is already running → do nothing.
 3. **Jitter** — window closed → wait `0..jitter-max` seconds (default 180), then
    re-check (normal activity during the jitter may have already opened one).
@@ -81,8 +81,8 @@ ln -sf "$PWD/claude-auto-window" ~/.local/bin/claude-auto-window
 claude-auto-window --status      # smoke test: prints your current 5h state
 ```
 
-`claude-usage.zsh` ships next to the script and is sourced automatically — no
-extra step.
+It's a **single self-contained script** — the OAuth token read + usage fetch are
+built in, no other files to install.
 
 ## Modes
 
@@ -281,8 +281,7 @@ claude-auto-window-once
 
 | File | Purpose |
 |---|---|
-| `claude-auto-window` | The script (executable + source-able). |
-| `claude-usage.zsh` | Bundled OAuth usage reader (the window check). |
+| `claude-auto-window` | The whole tool — one self-contained script. |
 | `claude-auto-window@.service` | systemd `--user` template (per-profile). |
 | `claude-auto-window.plist` | macOS launchd template. |
 | `claude-auto-window.env.example` | All env overrides, documented. |
