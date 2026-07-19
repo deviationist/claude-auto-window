@@ -708,7 +708,10 @@ claude-auto-window-once() {
   emulate -L zsh
   local dir lock rc
   local jitter_max="${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}"
+  local jitter_min="${CLAUDE_AUTO_WINDOW_JITTER_MIN_SECONDS:-0}"
   _caw_validate_uint CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS "$jitter_max" || return $?
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_JITTER_MIN_SECONDS "$jitter_min" || return $?
+  (( jitter_min > jitter_max )) && jitter_max=$jitter_min   # clamp: keep min <= max
   dir="$(_caw_check_dir)"
 
   lock="$(_caw_acquire_lock "$dir")"; rc=$?
@@ -752,11 +755,11 @@ claude-auto-window-once() {
       return 0
     fi
 
-    # Jitter: we know we must open one, but wait 0..max first so many hosts /
-    # cron ticks don't stampede the endpoint at the same instant.
-    local delay; delay="$(_caw_random "$jitter_max")"
+    # Jitter: we know we must open one, but wait a random min..max first so many
+    # hosts / cron ticks don't stampede the endpoint at the same instant.
+    local delay; delay=$(( jitter_min + $(_caw_random "$(( jitter_max - jitter_min ))") ))
     if (( delay > 0 )); then
-      _caw_log INFO "Window closed; jittering ${delay}s (max ${jitter_max}s) before starter"
+      _caw_log INFO "Window closed; jittering ${delay}s (${jitter_min}-${jitter_max}s) before starter"
       sleep "$delay"
     fi
 
@@ -813,6 +816,8 @@ claude-auto-window-daemon() {
   local maxsleep="${CLAUDE_AUTO_WINDOW_MAX_SLEEP_SECONDS:-21600}"
   _caw_validate_uint CLAUDE_AUTO_WINDOW_MAX_SLEEP_SECONDS "$maxsleep" || return $?
   (( maxsleep < interval )) && maxsleep=$interval
+  local buffer="${CLAUDE_AUTO_WINDOW_POST_EXPIRY_SECONDS:-5}"   # wake this long after expiry
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_POST_EXPIRY_SECONDS "$buffer" || return $?
 
   # Fail fast on persistent config errors so systemd's restart policy sees them.
   _caw_resolve_claude_bin >/dev/null || return $?
@@ -837,18 +842,19 @@ claude-auto-window-daemon() {
       _caw_log WARN "Cycle failed (status $rc); retrying in ${interval}s"
     fi
 
-    # If a window is open with a known reset time, sleep until ~one interval
-    # before expiry (capped); otherwise poll at the fine interval (confirm a
-    # freshly opened window, or count down the last interval before expiry).
+    # If a window is open with a known reset time, sleep until just AFTER it
+    # expires (resets_at + buffer): the next check then sees it closed and fires,
+    # with no wasted pre-expiry poll. Otherwise poll at the fine interval to
+    # confirm a freshly opened window (the endpoint lags a few minutes).
     sleep_for=$interval
     if [[ -n "$_CAW_RESET_AT" ]]; then
       reset_epoch="$(_caw_iso_to_epoch "$_CAW_RESET_AT")"
       if [[ "$reset_epoch" == <-> ]]; then
         now_s=$(date +%s)
-        sleep_for=$(( reset_epoch - interval - now_s ))
-        (( sleep_for < interval )) && sleep_for=$interval   # within the last interval → keep polling
-        (( sleep_for > maxsleep )) && sleep_for=$maxsleep   # safety cap
-        _caw_log INFO "Window open until $_CAW_RESET_AT; sleeping ${sleep_for}s"
+        sleep_for=$(( reset_epoch + buffer - now_s ))       # wake just after expiry
+        (( sleep_for < 1 )) && sleep_for=1                  # ~expired already → check now
+        (( sleep_for > maxsleep )) && sleep_for=$maxsleep   # safety cap (clock drift / suspend)
+        _caw_log INFO "Window open until $_CAW_RESET_AT; sleeping ${sleep_for}s (wake ${buffer}s after expiry)"
       fi
     fi
     (( stop )) || sleep "$sleep_for" || true
@@ -895,11 +901,16 @@ Profile:
 
 Tuning (all also settable via CLAUDE_AUTO_WINDOW_* env, or a config file at
 $XDG_CONFIG_HOME/claude-auto-window/config):
-  --interval SEC           Daemon FINE-poll interval (confirm a just-opened
-                           window; count down the last interval before expiry).
-                           The daemon otherwise sleeps until ~expiry.  Default: 60
+  --interval SEC           Daemon confirm-poll interval — how often to re-check
+                           while waiting for the endpoint to reflect a just-opened
+                           window. (Open windows are slept-through, not polled.)
+                                                               Default: 60
+  --post-expiry SEC        Daemon wakes this long after a window's expiry to fire
+                           the next starter.                   Default: 5
   --max-sleep SEC          Cap on a single adaptive sleep (safety).  Default: 21600
-  --jitter-max SEC         Max wait before opening a window.   Default: 180
+  --jitter-max SEC         Upper bound of the random wait before firing. Keep
+                           small on a single daemon for tight windows. Default: 180
+  --jitter-min SEC         Lower bound of the random wait before firing. Default: 0
   --reply-timeout SEC      How long to wait for the reply.     Default: 120
   --verify-delay SEC       Delay before post-open verify.      Default: 3
   --prompt TEXT            Starter prompt. Default: "Reply with exactly: OK."
@@ -969,8 +980,12 @@ _caw_main() {
       --interval=*)      typeset -gx CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS="${1#*=}" ;;
       --max-sleep)       typeset -gx CLAUDE_AUTO_WINDOW_MAX_SLEEP_SECONDS="$2"; shift ;;
       --max-sleep=*)     typeset -gx CLAUDE_AUTO_WINDOW_MAX_SLEEP_SECONDS="${1#*=}" ;;
+      --post-expiry)     typeset -gx CLAUDE_AUTO_WINDOW_POST_EXPIRY_SECONDS="$2"; shift ;;
+      --post-expiry=*)   typeset -gx CLAUDE_AUTO_WINDOW_POST_EXPIRY_SECONDS="${1#*=}" ;;
       --jitter-max)      typeset -gx CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS="$2"; shift ;;
       --jitter-max=*)    typeset -gx CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS="${1#*=}" ;;
+      --jitter-min)      typeset -gx CLAUDE_AUTO_WINDOW_JITTER_MIN_SECONDS="$2"; shift ;;
+      --jitter-min=*)    typeset -gx CLAUDE_AUTO_WINDOW_JITTER_MIN_SECONDS="${1#*=}" ;;
       --reply-timeout)   typeset -gx CLAUDE_AUTO_WINDOW_REPLY_TIMEOUT_SECONDS="$2"; shift ;;
       --reply-timeout=*) typeset -gx CLAUDE_AUTO_WINDOW_REPLY_TIMEOUT_SECONDS="${1#*=}" ;;
       --verify-delay)    typeset -gx CLAUDE_AUTO_WINDOW_VERIFY_DELAY_SECONDS="$2"; shift ;;

@@ -168,11 +168,13 @@ State lives in `$CLAUDE_AUTO_WINDOW_STATE_DIR` (default
 ## The daemon doesn't poll continuously
 
 When a window is open, the daemon knows exactly when it ends (`resets_at`), so it
-**sleeps until ~1 fine-interval before expiry** instead of polling every few
-minutes. It only actually fetches in two situations: to **confirm** a just-opened
-window (the endpoint lags a few minutes) and to **count down** the final interval
-before expiry. So an idle-open window is ~2 requests per 5-hour window, not ~60.
-A safety cap (`--max-sleep`, default 6h) bounds any single sleep.
+**sleeps until just after it expires** (`resets_at + --post-expiry`, default 5 s),
+wakes, sees it closed, and fires the next starter — no polling in between. It only
+does repeated fetches to **confirm** a just-opened window (the endpoint lags a few
+minutes, re-checked every `--interval`). So an idle-open window is ~2 requests per
+5-hour window, not ~60. A safety cap (`--max-sleep`, default 6h) bounds any single
+sleep. The total gap after expiry is `post-expiry + jitter`, so keep `--jitter-max`
+small on a single daemon for tight back-to-back windows.
 
 (Cron can't do this — it's stateless external scheduling, so each `--once` fetches
 on the crontab's cadence.)
@@ -197,9 +199,10 @@ Every flag has a `CLAUDE_AUTO_WINDOW_*` env equivalent (see
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--interval` | `…_INTERVAL_SECONDS` | 60 | Daemon **fine-poll** interval (confirm/countdown) |
+| `--interval` | `…_INTERVAL_SECONDS` | 60 | Daemon **confirm-poll** interval (post-open) |
+| `--post-expiry` | `…_POST_EXPIRY_SECONDS` | 5 | Wake this long after expiry to fire |
 | `--max-sleep` | `…_MAX_SLEEP_SECONDS` | 21600 | Cap on one adaptive sleep |
-| `--jitter-max` | `…_JITTER_MAX_SECONDS` | 180 | Wait 0..N before opening |
+| `--jitter-max` | `…_JITTER_MAX_SECONDS` | 180 | Extra 0..N wait before firing (small on a daemon) |
 | `--model` | `…_MODEL` | `haiku` | Model alias/id, `""` = account default |
 | `--max-failures` | `…_MAX_FAILURES` | 3 | Failed opens before the breaker trips |
 | `--log` | `…_LOG` | — | Opt-in log file |
