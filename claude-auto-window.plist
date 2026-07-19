@@ -39,8 +39,6 @@
   <dict>
     <key>PATH</key>
     <string>__HOME__/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    <key>CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS</key>
-    <string>300</string>
     <key>CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS</key>
     <string>180</string>
   </dict>

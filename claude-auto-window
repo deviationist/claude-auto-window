@@ -170,8 +170,13 @@ _caw_usage_json() {
 # false on an open-but-idle window) and adds no coverage resets_at doesn't already
 # give — and worse, a lingering `is_active` on a *past* resets_at could falsely
 # read "open". resets_at is the one signal.
+# On a confirmed-open return (0), this also exports _CAW_RESET_AT (the future
+# reset timestamp, for the daemon's adaptive sleep) and records profile +
+# resets_at in the per-profile state file (self-documents which subscription the
+# opaque <hash>.state belongs to; supports multi-profile setups).
 _caw_session_active() {
   emulate -L zsh
+  typeset -g _CAW_RESET_AT=""
   local dir="$1" json has sess resets now
   json="$(_caw_usage_json "$dir")" || return 3
   [[ -n "$json" ]] || return 3
@@ -186,8 +191,24 @@ _caw_session_active() {
   # resets_at and `date -u` are both UTC ISO-8601, so a lexical compare of the
   # fixed-width YYYY-MM-DDTHH:MM:SS prefix is a correct chronological compare.
   now="$(date -u +%Y-%m-%dT%H:%M:%S)"
-  [[ "${resets:0:19}" > "$now" ]] && return 0             # future → open
+  if [[ "${resets:0:19}" > "$now" ]]; then                # future → open
+    _CAW_RESET_AT="$resets"
+    _caw_state_set "$dir" profile "$dir"
+    _caw_state_set "$dir" resets_at "$resets"
+    return 0
+  fi
   return 1                                                # null / past → closed
+}
+
+# Convert a UTC ISO-8601 timestamp (e.g. 2026-07-19T06:40:00.351+00:00) to epoch
+# seconds. Tries BSD (macOS) then GNU (Linux) date. Non-zero if unparseable.
+_caw_iso_to_epoch() {
+  emulate -L zsh
+  local dt="${1:0:19}" e                                  # YYYY-MM-DDTHH:MM:SS, UTC
+  [[ -n "$dt" ]] || return 1
+  e="$(date -u -j -f "%Y-%m-%dT%H:%M:%S" "$dt" +%s 2>/dev/null)" && { print -r -- "$e"; return 0; }
+  e="$(date -u -d "${dt}Z" +%s 2>/dev/null)" && { print -r -- "$e"; return 0; }
+  return 1
 }
 
 # Print a human status line.
@@ -315,54 +336,45 @@ _caw_release_lock() {
 }
 
 # ----------------------------------------------------------------------------
-# Post-open cooldown — the usage endpoint takes a few minutes to reflect a
-# freshly opened window (propagation lag), during which _caw_session_active
-# still reads "closed". There's only ever ONE window; the risk isn't a "second
-# window" (impossible) but the daemon firing a redundant starter every tick
-# during that blind spot — extra, pointless usage against the already-open
-# window. We stamp a marker on every successful open and suppress re-firing for
-# CLAUDE_AUTO_WINDOW_OPEN_COOLDOWN_SECONDS (default 900).
+# Config & state locations (XDG):
+#   config  ${XDG_CONFIG_HOME:-~/.config}/claude-auto-window/  — settings you set
+#   state   ${XDG_STATE_HOME:-~/.local/state}/claude-auto-window/ — data we write
+# A per-profile <hash>.state file (key=value) holds the failure counter and the
+# open-timing; the disable sentinel (<hash>.tripped) is its own file so
+# "present = disabled" stays a trivial touch/rm kill-switch. The process lock
+# stays a transient tmp mkdir-lock (see _caw_lock_path).
 # ----------------------------------------------------------------------------
-_caw_open_marker_path() {
+_caw_config_dir() {
   emulate -L zsh
-  local dir="$1" suffix
-  suffix="$(printf '%s' "${dir:a}" | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | cut -c1-8)"
-  [[ -n "$suffix" ]] || suffix="default"
-  print -r -- "${TMPDIR:-/tmp}/claude-auto-window.${suffix}.lastopen"
+  print -r -- "${XDG_CONFIG_HOME:-$HOME/.config}/claude-auto-window"
 }
 
-_caw_mark_opened() {
+# Auto-load a config file (cron/manual convenience) so settings need not be
+# repeated as flags. Only fills CLAUDE_AUTO_WINDOW_* vars NOT already set, so the
+# environment (systemd EnvironmentFile) and CLI flags still win. Values are
+# literal, like a systemd EnvironmentFile — no shell quoting.
+_caw_load_config() {
   emulate -L zsh
-  print -r -- "$(date +%s)" > "$(_caw_open_marker_path "$1")" 2>/dev/null
+  local f="${CLAUDE_AUTO_WINDOW_CONFIG:-$(_caw_config_dir)/config}"
+  [[ -r "$f" ]] || return 0
+  local line key val
+  while IFS= read -r line; do
+    [[ -z "${line//[[:space:]]/}" || "${line##[[:space:]]#}" == \#* ]] && continue
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"; key="${key//[[:space:]]/}"
+    [[ "$key" == CLAUDE_AUTO_WINDOW_* ]] || continue
+    [[ -n "${(P)key+x}" ]] && continue          # already set by env/flags → keep it
+    val="${line#*=}"
+    typeset -gx "$key=$val"
+  done < "$f"
 }
 
-# Success (0) if we opened a window within the cooldown window.
-_caw_recently_opened() {
-  emulate -L zsh
-  local dir="$1" cooldown="${CLAUDE_AUTO_WINDOW_OPEN_COOLDOWN_SECONDS:-900}" marker t
-  _caw_validate_uint CLAUDE_AUTO_WINDOW_OPEN_COOLDOWN_SECONDS "$cooldown" || return 1
-  marker="$(_caw_open_marker_path "$dir")"
-  [[ -r "$marker" ]] || return 1
-  t="$(<"$marker")"; [[ "$t" == <-> ]] || return 1
-  (( $(date +%s) - t < cooldown ))
-}
-
-# ----------------------------------------------------------------------------
-# Circuit breaker — stop an endless loop. If we keep firing starters but the
-# window never registers as open (a real fault, or pathological endpoint lag),
-# we'd otherwise re-fire forever. So: count consecutive opens that never confirm;
-# after CLAUDE_AUTO_WINDOW_MAX_FAILURES (default 3) we TRIP — notify + refuse to
-# run until manually reset. The trip is a persistent file so a cron job no-ops
-# and a restarted daemon stays stopped. Counter resets whenever a window is
-# confirmed open. State lives in a durable dir (survives reboot), unlike the
-# transient tmp lock/cooldown markers.
-# ----------------------------------------------------------------------------
 _caw_state_dir() {
   emulate -L zsh
   print -r -- "${CLAUDE_AUTO_WINDOW_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-auto-window}"
 }
 
-_caw_state_file() {   # $1 = config dir, $2 = short name
+_caw_state_file() {   # $1 = config dir, $2 = short name (state | tripped)
   emulate -L zsh
   local dir="$1" name="$2" suffix
   suffix="$(printf '%s' "${dir:a}" | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | cut -c1-8)"
@@ -370,25 +382,84 @@ _caw_state_file() {   # $1 = config dir, $2 = short name
   print -r -- "$(_caw_state_dir)/${suffix}.${name}"
 }
 
+# key=value store in <hash>.state --------------------------------------------
+_caw_state_get() {   # $1 = dir, $2 = key → prints value, non-zero if absent
+  emulate -L zsh
+  local f key="$2" line; f="$(_caw_state_file "$1" state)"
+  [[ -r "$f" ]] || return 1
+  while IFS= read -r line; do
+    [[ "$line" == "$key="* ]] && { print -r -- "${line#*=}"; return 0; }
+  done < "$f"
+  return 1
+}
+
+_caw_state_set() {   # $1 = dir, $2 = key, $3 = value (atomic rewrite)
+  emulate -L zsh
+  local f key="$2" val="$3" tmp line found=0; f="$(_caw_state_file "$1" state)"
+  mkdir -p "${f:h}" 2>/dev/null
+  tmp="$f.tmp.$$"
+  {
+    [[ -r "$f" ]] && while IFS= read -r line; do
+      if [[ "$line" == "$key="* ]]; then print -r -- "$key=$val"; found=1
+      else print -r -- "$line"; fi
+    done < "$f"
+    (( found )) || print -r -- "$key=$val"
+  } > "$tmp" 2>/dev/null && mv "$tmp" "$f" 2>/dev/null
+}
+
+_caw_state_del() {   # $1 = dir, $2 = key
+  emulate -L zsh
+  local f key="$2" tmp line; f="$(_caw_state_file "$1" state)"
+  [[ -r "$f" ]] || return 0
+  tmp="$f.tmp.$$"
+  { while IFS= read -r line; do [[ "$line" == "$key="* ]] || print -r -- "$line"; done < "$f"; } \
+    > "$tmp" 2>/dev/null && mv "$tmp" "$f" 2>/dev/null
+}
+
+# ----------------------------------------------------------------------------
+# Post-open cooldown — the usage endpoint takes a few minutes to reflect a
+# freshly opened window; during that lag _caw_session_active still reads
+# "closed". We stamp last_open on every successful open and suppress re-firing
+# for CLAUDE_AUTO_WINDOW_OPEN_COOLDOWN_SECONDS (default 900) so the daemon/cron
+# doesn't fire a redundant starter while the endpoint catches up.
+# ----------------------------------------------------------------------------
+_caw_mark_opened() {
+  emulate -L zsh
+  _caw_state_set "$1" last_open "$(date +%s)"
+}
+
+_caw_recently_opened() {   # 0 if we opened a window within the cooldown
+  emulate -L zsh
+  local dir="$1" cooldown="${CLAUDE_AUTO_WINDOW_OPEN_COOLDOWN_SECONDS:-900}" t
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_OPEN_COOLDOWN_SECONDS "$cooldown" || return 1
+  t="$(_caw_state_get "$dir" last_open)" || return 1
+  [[ "$t" == <-> ]] || return 1
+  (( $(date +%s) - t < cooldown ))
+}
+
+# ----------------------------------------------------------------------------
+# Circuit breaker — stop an endless loop. Count consecutive opens that never
+# register a window; after CLAUDE_AUTO_WINDOW_MAX_FAILURES (default 3) TRIP:
+# notify + write the sentinel + refuse to run until --reset. The counter (in the
+# state file) resets whenever a window is confirmed open. The sentinel is its own
+# durable file so a cron job no-ops and a restarted daemon stays stopped.
+# ----------------------------------------------------------------------------
 _caw_breaker_count() {
   emulate -L zsh
-  local f n; f="$(_caw_state_file "$1" failcount)"
-  [[ -r "$f" ]] && n="$(<"$f")"; [[ "$n" == <-> ]] || n=0
+  local n; n="$(_caw_state_get "$1" failcount)"; [[ "$n" == <-> ]] || n=0
   print -r -- "$n"
 }
 
 _caw_breaker_inc() {
   emulate -L zsh
-  local f n; f="$(_caw_state_file "$1" failcount)"
-  mkdir -p "${f:h}" 2>/dev/null
-  n=$(( $(_caw_breaker_count "$1") + 1 ))
-  print -r -- "$n" > "$f" 2>/dev/null
+  local n=$(( $(_caw_breaker_count "$1") + 1 ))
+  _caw_state_set "$1" failcount "$n"
   print -r -- "$n"
 }
 
-_caw_breaker_reset() {   # clear the consecutive-failure counter (window healthy)
+_caw_breaker_reset() {   # window healthy → clear the counter
   emulate -L zsh
-  rm -f "$(_caw_state_file "$1" failcount)" 2>/dev/null
+  _caw_state_del "$1" failcount
 }
 
 _caw_breaker_trip() {    # $2 = reason
@@ -400,7 +471,7 @@ _caw_breaker_trip() {    # $2 = reason
 
 _caw_breaker_tripped() { emulate -L zsh; [[ -e "$(_caw_state_file "$1" tripped)" ]]; }
 _caw_breaker_reason()  { emulate -L zsh; local f; f="$(_caw_state_file "$1" tripped)"; [[ -r "$f" ]] && cat "$f" 2>/dev/null; }
-_caw_breaker_clear()   { emulate -L zsh; rm -f "$(_caw_state_file "$1" tripped)" "$(_caw_state_file "$1" failcount)" 2>/dev/null; }
+_caw_breaker_clear()   { emulate -L zsh; rm -f "$(_caw_state_file "$1" tripped)" 2>/dev/null; _caw_state_del "$1" failcount; }
 
 # Fire an operator notification, if a hook command is configured. The message is
 # passed both on stdin and as $CLAUDE_AUTO_WINDOW_MESSAGE, so hooks can use either
@@ -728,14 +799,20 @@ Re-enable with:  claude-auto-window --reset
   }
 }
 
-# Daemon: run the guarded cycle on a fixed cadence. Ticks stay aligned to the
-# daemon start; a cycle that overruns (jitter) skips missed ticks rather than
-# queueing them.
+# Daemon: run the guarded cycle, then sleep ADAPTIVELY instead of polling on a
+# fixed cadence. When a window is open we know exactly when it ends (resets_at),
+# so we sleep until ~one fine-interval before then — no continuous polling. We
+# only poll at the fine interval in two situations: to confirm a just-opened
+# window (the endpoint lags a few minutes), and to count down the final interval
+# before expiry. A safety cap (MAX_SLEEP) bounds any single sleep.
 claude-auto-window-daemon() {
   emulate -L zsh
-  local interval="${CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS:-300}"
+  local interval="${CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS:-60}"
   _caw_validate_uint CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS "$interval" || return $?
   (( interval >= 1 )) || { _caw_log ERROR "interval must be >= 1"; return 2; }
+  local maxsleep="${CLAUDE_AUTO_WINDOW_MAX_SLEEP_SECONDS:-21600}"
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_MAX_SLEEP_SECONDS "$maxsleep" || return $?
+  (( maxsleep < interval )) && maxsleep=$interval
 
   # Fail fast on persistent config errors so systemd's restart policy sees them.
   _caw_resolve_claude_bin >/dev/null || return $?
@@ -743,9 +820,8 @@ claude-auto-window-daemon() {
   local stop=0
   trap 'stop=1' INT TERM HUP
 
-  _caw_log INFO "Daemon up: poll every ${interval}s, jitter 0-${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}s"
-  local next now rc
-  now="$(date +%s)"; next="$now"
+  _caw_log INFO "Daemon up: adaptive sleep (fine poll ${interval}s, max sleep ${maxsleep}s), jitter 0-${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}s"
+  local rc sleep_for reset_epoch now_s
   while (( ! stop )); do
     claude-auto-window-once; rc=$?
     if (( rc == 2 )); then
@@ -756,14 +832,26 @@ claude-auto-window-daemon() {
       return 0                        # clean exit → systemd leaves it stopped, no restart loop
     elif (( rc == 3 )); then
       _caw_log ERROR "Circuit breaker tripped — daemon exiting to avoid a loop. Reset with: claude-auto-window --reset"
-      return 0                        # clean exit; the persistent trip file keeps it stopped across restarts
+      return 0                        # clean exit; the persistent sentinel keeps it stopped across restarts
     elif (( rc != 0 && rc != 75 )); then
-      _caw_log WARN "Cycle failed (status $rc); retrying next tick"
+      _caw_log WARN "Cycle failed (status $rc); retrying in ${interval}s"
     fi
-    next=$(( next + interval ))
-    now="$(date +%s)"
-    while (( next <= now )); do next=$(( next + interval )); done
-    (( stop )) || sleep $(( next - now )) || true
+
+    # If a window is open with a known reset time, sleep until ~one interval
+    # before expiry (capped); otherwise poll at the fine interval (confirm a
+    # freshly opened window, or count down the last interval before expiry).
+    sleep_for=$interval
+    if [[ -n "$_CAW_RESET_AT" ]]; then
+      reset_epoch="$(_caw_iso_to_epoch "$_CAW_RESET_AT")"
+      if [[ "$reset_epoch" == <-> ]]; then
+        now_s=$(date +%s)
+        sleep_for=$(( reset_epoch - interval - now_s ))
+        (( sleep_for < interval )) && sleep_for=$interval   # within the last interval → keep polling
+        (( sleep_for > maxsleep )) && sleep_for=$maxsleep   # safety cap
+        _caw_log INFO "Window open until $_CAW_RESET_AT; sleeping ${sleep_for}s"
+      fi
+    fi
+    (( stop )) || sleep "$sleep_for" || true
   done
   _caw_log INFO "Daemon stopped"
   return 0
@@ -805,8 +893,12 @@ Profile:
   --profile NAME           default | personal | work | <abs path>
                            (default = let Claude Code resolve ~/.claude)
 
-Tuning (all also settable via CLAUDE_AUTO_WINDOW_* env):
-  --interval SEC           Daemon poll interval.               Default: 300
+Tuning (all also settable via CLAUDE_AUTO_WINDOW_* env, or a config file at
+$XDG_CONFIG_HOME/claude-auto-window/config):
+  --interval SEC           Daemon FINE-poll interval (confirm a just-opened
+                           window; count down the last interval before expiry).
+                           The daemon otherwise sleeps until ~expiry.  Default: 60
+  --max-sleep SEC          Cap on a single adaptive sleep (safety).  Default: 21600
   --jitter-max SEC         Max wait before opening a window.   Default: 180
   --reply-timeout SEC      How long to wait for the reply.     Default: 120
   --verify-delay SEC       Delay before post-open verify.      Default: 3
@@ -850,6 +942,10 @@ _caw_main() {
   emulate -L zsh
   setopt local_options
 
+  # Load a config file first (lowest priority): fills CLAUDE_AUTO_WINDOW_* vars
+  # not already set in the environment; CLI flags below override both.
+  _caw_load_config
+
   local mode="once" mode_set=0 profile="" config_dir=""
   while (( $# )); do
     case "$1" in
@@ -871,6 +967,8 @@ _caw_main() {
       --config-dir=*)    config_dir="${1#*=}" ;;
       --interval)        typeset -gx CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS="$2"; shift ;;
       --interval=*)      typeset -gx CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS="${1#*=}" ;;
+      --max-sleep)       typeset -gx CLAUDE_AUTO_WINDOW_MAX_SLEEP_SECONDS="$2"; shift ;;
+      --max-sleep=*)     typeset -gx CLAUDE_AUTO_WINDOW_MAX_SLEEP_SECONDS="${1#*=}" ;;
       --jitter-max)      typeset -gx CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS="$2"; shift ;;
       --jitter-max=*)    typeset -gx CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS="${1#*=}" ;;
       --reply-timeout)   typeset -gx CLAUDE_AUTO_WINDOW_REPLY_TIMEOUT_SECONDS="$2"; shift ;;

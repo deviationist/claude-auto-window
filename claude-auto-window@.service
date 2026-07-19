@@ -34,7 +34,9 @@ Type=simple
 # tmux + claude usually live in user-local / npm bins that aren't on the stock
 # service PATH — make them reachable.
 Environment=PATH=%h/.local/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
-Environment=CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS=300
+# The daemon sleeps adaptively (until ~window expiry); INTERVAL is only the
+# fine-poll interval used to confirm/countdown. Defaults are fine; override here
+# or in the EnvironmentFile below if needed.
 Environment=CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS=180
 # Per-instance overrides (optional). "-" = tolerate a missing file.
 EnvironmentFile=-%h/.config/claude-auto-window/%i.env

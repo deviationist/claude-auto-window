@@ -165,6 +165,31 @@ otherwise re-fire a pointless starter forever. To prevent that:
 State lives in `$CLAUDE_AUTO_WINDOW_STATE_DIR` (default
 `~/.local/state/claude-auto-window`), so it survives reboots.
 
+## The daemon doesn't poll continuously
+
+When a window is open, the daemon knows exactly when it ends (`resets_at`), so it
+**sleeps until ~1 fine-interval before expiry** instead of polling every few
+minutes. It only actually fetches in two situations: to **confirm** a just-opened
+window (the endpoint lags a few minutes) and to **count down** the final interval
+before expiry. So an idle-open window is ~2 requests per 5-hour window, not ~60.
+A safety cap (`--max-sleep`, default 6h) bounds any single sleep.
+
+(Cron can't do this — it's stateless external scheduling, so each `--once` fetches
+on the crontab's cadence.)
+
+## Config file
+
+For cron/manual runs, the script auto-loads
+`$XDG_CONFIG_HOME/claude-auto-window/config` (usually
+`~/.config/claude-auto-window/config`) — `KEY=value` lines, same keys as
+`claude-auto-window.env.example`. Env vars and CLI flags override it. (systemd
+users can keep using `EnvironmentFile` instead.)
+
+Runtime state lives per-profile in `~/.local/state/claude-auto-window/`: a
+`<hash>.state` file (records the `profile` path, last `resets_at`, failure count,
+last-open time — self-documenting for multi-profile setups) plus the standalone
+`<hash>.tripped` disable sentinel.
+
 ## Tuning
 
 Every flag has a `CLAUDE_AUTO_WINDOW_*` env equivalent (see
@@ -172,17 +197,18 @@ Every flag has a `CLAUDE_AUTO_WINDOW_*` env equivalent (see
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
-| `--interval` | `…_INTERVAL_SECONDS` | 300 | Daemon poll cadence |
+| `--interval` | `…_INTERVAL_SECONDS` | 60 | Daemon **fine-poll** interval (confirm/countdown) |
+| `--max-sleep` | `…_MAX_SLEEP_SECONDS` | 21600 | Cap on one adaptive sleep |
 | `--jitter-max` | `…_JITTER_MAX_SECONDS` | 180 | Wait 0..N before opening |
-| `--reply-timeout` | `…_REPLY_TIMEOUT_SECONDS` | 120 | Give up waiting for the reply |
 | `--model` | `…_MODEL` | `haiku` | Model alias/id, `""` = account default |
+| `--max-failures` | `…_MAX_FAILURES` | 3 | Failed opens before the breaker trips |
 | `--log` | `…_LOG` | — | Opt-in log file |
 
 ## Running it continuously
 
 Pick your platform × style. In all cases, symlink the script to
-`~/.local/bin/claude-auto-window` first (see *Install*). The daemon does its own
-polling and jitter; a cron entry runs `--once` on a schedule instead.
+`~/.local/bin/claude-auto-window` first (see *Install*). The daemon sleeps
+adaptively (above); a cron entry runs `--once` on a schedule instead.
 
 ### Linux — systemd `--user` (daemon)
 
