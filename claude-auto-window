@@ -1,0 +1,905 @@
+#!/usr/bin/env zsh
+# ============================================================================
+# claude-auto-window — keep a Claude five-hour usage window perpetually open
+# ============================================================================
+# Goal: always have a 5-hour session window running, back to back, spending as
+# few tokens as possible. When a window has lapsed, this opens a fresh one by
+# driving a *real interactive* Claude Code session inside a throwaway tmux
+# session — send one trivial prompt, wait for the reply, quit, tear the tmux
+# session down. That single request is enough to anchor a new 5-hour window,
+# so the next time you actually need Claude there is no cold-start wait.
+#
+# This is deliberately NOT the headless `claude -p` approach (see
+# ../claude-auto-window-old for that Codex-authored variant) — we drive the
+# genuine TUI path through tmux instead.
+#
+# The window check reuses ../claude-usage.zsh (your own OAuth usage reader),
+# so no Anthropic API key is required — Claude Code's existing login is used.
+#
+# ---------------------------------------------------------------------------
+# Modes (pick one; --once is the default)
+#   --run          Fire one starter now, no checks, no jitter. ("just do it")
+#   --once         Check the window; only if none is open, jitter then fire.
+#   --daemon       Loop --once at a fixed interval (systemd/launchd target).
+#   --status       Print the current five-hour session state and exit.
+#
+# Profile
+#   Default: let Claude Code resolve its own profile (~/.claude) — we never set
+#   CLAUDE_CONFIG_DIR for the launch. Multi-profile support:
+#     --config-dir PATH   explicit Claude profile dir (sets CLAUDE_CONFIG_DIR)
+#     --profile NAME      default | personal | work | <abs path>
+#
+# Observability
+#   Logs go to stdout/stderr always (journal-friendly). Opt in to a file with
+#   --log PATH (or CLAUDE_AUTO_WINDOW_LOG). Nothing is written to a file unless
+#   you ask for it.
+#
+# This file is both executable and source-able:
+#   ./claude-auto-window --once
+#   source ./claude-auto-window && claude-auto-window-once
+# ============================================================================
+
+typeset -g CLAUDE_AUTO_WINDOW_VERSION="1.0.0"
+
+# ----------------------------------------------------------------------------
+# Logging — stdout/stderr always; append to $CLAUDE_AUTO_WINDOW_LOG if opted in.
+# ----------------------------------------------------------------------------
+_caw_log() {
+  emulate -L zsh
+  local level="$1"; shift
+  local line="$(date '+%Y-%m-%d %H:%M:%S') [$level] $*"
+  # --quiet (CLAUDE_AUTO_WINDOW_QUIET=1) suppresses console output so a cron job
+  # doesn't email on every routine run — logs still go to the file. systemd/
+  # journal users leave it off so the journal keeps capturing output.
+  if [[ "${CLAUDE_AUTO_WINDOW_QUIET:-0}" != 1 ]]; then
+    if [[ "$level" == "ERROR" || "$level" == "WARN" ]]; then
+      print -u2 -r -- "$line"
+    else
+      print -r -- "$line"
+    fi
+  fi
+  [[ -n "${CLAUDE_AUTO_WINDOW_LOG:-}" ]] && print -r -- "$line" >> "$CLAUDE_AUTO_WINDOW_LOG"
+}
+
+_caw_validate_uint() {
+  emulate -L zsh
+  local name="$1" value="$2"
+  if [[ "$value" != <-> ]]; then
+    _caw_log ERROR "$name must be a non-negative integer (got: $value)"
+    return 2
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Profile / binary resolution
+# ----------------------------------------------------------------------------
+# The dir used for the *window check* — always a concrete path (usage endpoint
+# needs one). Defaults to ~/.claude even when we let Claude pick its own profile
+# for the launch, because that is Claude Code's own default profile too.
+_caw_check_dir() {
+  local dir="${CLAUDE_AUTO_WINDOW_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+  print -r -- "${dir%/}"
+}
+
+# Whether to pin CLAUDE_CONFIG_DIR for the launch. Only when the operator
+# explicitly selected a profile — otherwise we stay a transparent passthrough
+# and Claude Code resolves ~/.claude on its own (mirrors claude-profile.zsh).
+_caw_launch_profile_pinned() {
+  [[ -n "${CLAUDE_AUTO_WINDOW_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-}}" ]]
+}
+
+_caw_resolve_claude_bin() {
+  emulate -L zsh
+  local configured="${CLAUDE_AUTO_WINDOW_CLAUDE_BIN:-}"
+  if [[ -n "$configured" ]]; then
+    [[ -x "$configured" ]] && { print -r -- "$configured"; return 0; }
+    _caw_log ERROR "CLAUDE_AUTO_WINDOW_CLAUDE_BIN is not executable: $configured"
+    return 2
+  fi
+  local found; found="$(whence -p claude 2>/dev/null)"
+  [[ -n "$found" && -x "$found" ]] && { print -r -- "$found"; return 0; }
+  local c
+  for c in /opt/homebrew/bin/claude "$HOME/.local/bin/claude" \
+           "$HOME/.npm-global/bin/claude" /usr/local/bin/claude /usr/bin/claude; do
+    [[ -x "$c" ]] && { print -r -- "$c"; return 0; }
+  done
+  _caw_log ERROR "claude executable not found; set CLAUDE_AUTO_WINDOW_CLAUDE_BIN"
+  return 2
+}
+
+# ----------------------------------------------------------------------------
+# Usage-endpoint helpers — reuse ../claude-usage.zsh (your own OAuth reader).
+# ----------------------------------------------------------------------------
+_caw_load_usage_lib() {
+  emulate -L zsh
+  typeset -f claude-usage >/dev/null 2>&1 && return 0
+  local here="${${(%):-%x}:A:h}"
+  local -a candidates
+  [[ -n "${CLAUDE_AUTO_WINDOW_USAGE_LIB:-}" ]] && candidates+=( "$CLAUDE_AUTO_WINDOW_USAGE_LIB" )
+  candidates+=( "$here/claude-usage.zsh" "$here/../claude-usage.zsh" )   # bundled sibling, then dotfiles layout
+  local lib
+  for lib in "${candidates[@]}"; do
+    if [[ -r "$lib" ]]; then
+      source "$lib"
+      typeset -f claude-usage >/dev/null 2>&1 && return 0
+    fi
+  done
+  _caw_log ERROR "claude-usage.zsh not found (looked in: ${candidates[*]}); set CLAUDE_AUTO_WINDOW_USAGE_LIB"
+  return 3
+}
+
+# Fresh normalized usage JSON for a profile dir.
+_caw_usage_json() {
+  emulate -L zsh
+  local dir="$1"
+  _caw_load_usage_lib || return 3
+  claude-usage --dir "$dir" --fresh --json 2>/dev/null
+}
+
+# Is a five-hour window currently open?
+#   0 = open, 1 = closed, 2 = account has NO 5h window (API/usage-billed seat —
+#   nothing to keep open), 3 = could not determine
+#
+# IMPORTANT: "open" is decided by `resets_at` being in the FUTURE, not by the
+# endpoint's `active`/`is_active` flag. That flag tracks *recent activity*, so an
+# open-but-idle window reads inactive — keying on it made the tool think a window
+# it had just opened was still closed. We treat either signal as open.
+_caw_session_active() {
+  emulate -L zsh
+  local dir="$1" json has sess active resets now
+  json="$(_caw_usage_json "$dir")" || return 3
+  [[ -n "$json" ]] || return 3
+  # Does this account use the 5-hour session-window model at all? Pro/Max do;
+  # API/usage-billed (Team/Enterprise/console) seats return no session limit.
+  has="$(jq '[.limits[]? | select(.kind=="session")] | length' <<< "$json" 2>/dev/null)"
+  [[ "$has" == <-> ]] || return 3
+  (( has == 0 )) && return 2
+  sess="$(jq -c 'first(.limits[]? | select(.kind=="session")) // {}' <<< "$json" 2>/dev/null)"
+  active="$(jq -r '.active // false'  <<< "$sess" 2>/dev/null)"
+  resets="$(jq -r '.resets_at // ""'  <<< "$sess" 2>/dev/null)"
+  [[ "$active" == "true" ]] && return 0
+  # resets_at and `date -u` are both UTC ISO-8601, so a lexical compare of the
+  # fixed-width YYYY-MM-DDTHH:MM:SS prefix is a correct chronological compare.
+  if [[ -n "$resets" && "$resets" != "null" ]]; then
+    now="$(date -u +%Y-%m-%dT%H:%M:%S)"
+    [[ "${resets:0:19}" > "$now" ]] && return 0
+  fi
+  return 1
+}
+
+# Print a human status line.
+_caw_status_line() {
+  emulate -L zsh
+  local dir="$1" rc json session open pct reset
+  _caw_session_active "$dir"; rc=$?
+  if (( rc == 3 )); then
+    _caw_log ERROR "usage lookup failed for $dir"; return 1
+  elif (( rc == 2 )); then
+    print -r -- "profile=$dir five_hour=n/a (no session window — API/usage-billed account?)"
+    return 0
+  fi
+  (( rc == 0 )) && open=yes || open=no
+  json="$(_caw_usage_json "$dir")"
+  session="$(jq -c 'first(.limits[]? | select(.kind=="session")) // {}' <<< "$json" 2>/dev/null)"
+  pct="$(jq -r '.percent // 0'       <<< "$session")"
+  reset="$(jq -r '.resets_at // "?"' <<< "$session")"
+  print -r -- "profile=$dir five_hour_open=$open percent=$pct resets_at=$reset"
+  if _caw_breaker_tripped "$dir"; then
+    print -r -- "  ⚠ DISABLED (sentinel present): $(_caw_state_file "$dir" tripped)"
+    print -r -- "    reason: $(_caw_breaker_reason "$dir")"
+    print -r -- "    re-enable: claude-auto-window --reset"
+  fi
+}
+
+# Public: clear a tripped circuit breaker (and the failure counter) so the
+# daemon/cron will resume opening windows.
+claude-auto-window-reset() {
+  emulate -L zsh
+  local dir; dir="$(_caw_check_dir)"
+  if _caw_breaker_tripped "$dir"; then
+    _caw_breaker_clear "$dir"
+    _caw_log INFO "Circuit breaker cleared for $dir — will resume on the next run"
+  else
+    _caw_breaker_clear "$dir"     # also clears any lingering counter
+    _caw_log INFO "No tripped breaker for $dir; cleared any failure counter"
+  fi
+}
+
+# Is a weekly allowance exhausted? (Don't burn a starter if capped.)
+_caw_weekly_exhausted() {
+  emulate -L zsh
+  local json="$1"
+  jq -e 'any(.limits[]?;
+      ((.kind=="weekly_all" or .kind=="weekly_scoped")
+       and (((.percent // 0) >= 100) or ((.severity // "normal") == "exceeded"))))' \
+    <<< "$json" >/dev/null 2>&1
+}
+
+# Random integer in [0, max], preferring /dev/urandom, falling back to $RANDOM.
+_caw_random() {
+  emulate -L zsh
+  local max="$1"
+  (( max > 0 )) || { print 0; return; }
+  local n=""
+  if [[ -r /dev/urandom ]] && command -v od >/dev/null 2>&1; then
+    n="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d '[:space:]')"
+  fi
+  [[ "$n" == <-> ]] || n="$RANDOM"
+  print $(( n % (max + 1) ))
+}
+
+# Generate a lowercase UUID for --session-id (Linux /proc first, uuidgen else).
+_caw_uuid() {
+  emulate -L zsh
+  local u=""
+  if [[ -r /proc/sys/kernel/random/uuid ]]; then
+    u="$(</proc/sys/kernel/random/uuid)"
+  elif command -v uuidgen >/dev/null 2>&1; then
+    u="$(uuidgen)"
+  fi
+  print -r -- "${u:l}"
+}
+
+# Delete the starter's own conversation transcript so it doesn't clutter the
+# log. We pin a known session id, so the file is exactly <uuid>.jsonl under the
+# active profile's projects/ tree (opt out with CLAUDE_AUTO_WINDOW_KEEP_TRANSCRIPT=1).
+_caw_cleanup_transcript() {
+  emulate -L zsh
+  setopt local_options extended_glob null_glob
+  local dir="$1" uuid="$2"
+  [[ "${CLAUDE_AUTO_WINDOW_KEEP_TRANSCRIPT:-0}" == 1 ]] && return 0
+  [[ -n "$uuid" && -d "$dir/projects" ]] || return 0
+  local -a hits
+  hits=( "$dir"/projects/**/"$uuid".jsonl )
+  if (( ${#hits} )); then
+    rm -f -- "${hits[@]}" 2>/dev/null
+    _caw_log INFO "Removed starter transcript (${uuid}.jsonl)"
+  fi
+}
+
+# ----------------------------------------------------------------------------
+# Per-profile process lock — never run two starters for the same profile at once.
+# ----------------------------------------------------------------------------
+_caw_lock_path() {
+  emulate -L zsh
+  local dir="$1" suffix
+  suffix="$(printf '%s' "${dir:a}" \
+    | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | cut -c1-8)"
+  [[ -n "$suffix" ]] || suffix="default"
+  print -r -- "${TMPDIR:-/tmp}/claude-auto-window.${suffix}.lock"
+}
+
+# Returns 0 (prints lock path) or 75 if another live process owns it.
+_caw_acquire_lock() {
+  emulate -L zsh
+  local dir="$1" lock owner
+  lock="$(_caw_lock_path "$dir")"
+  if ! mkdir "$lock" 2>/dev/null; then
+    [[ -r "$lock/pid" ]] && owner="$(<"$lock/pid")"
+    if [[ "$owner" == <-> ]] && kill -0 "$owner" 2>/dev/null; then
+      return 75
+    fi
+    rm -rf "$lock" 2>/dev/null
+    mkdir "$lock" 2>/dev/null || return 75
+  fi
+  print -r -- "$$" > "$lock/pid"
+  print -r -- "$lock"
+}
+
+_caw_release_lock() {
+  emulate -L zsh
+  [[ -n "$1" ]] && rm -rf "$1" 2>/dev/null
+}
+
+# ----------------------------------------------------------------------------
+# Post-open cooldown — the usage endpoint takes a few minutes to reflect a
+# freshly opened window (propagation lag), during which _caw_session_active
+# still reads "closed". There's only ever ONE window; the risk isn't a "second
+# window" (impossible) but the daemon firing a redundant starter every tick
+# during that blind spot — extra, pointless usage against the already-open
+# window. We stamp a marker on every successful open and suppress re-firing for
+# CLAUDE_AUTO_WINDOW_OPEN_COOLDOWN_SECONDS (default 900).
+# ----------------------------------------------------------------------------
+_caw_open_marker_path() {
+  emulate -L zsh
+  local dir="$1" suffix
+  suffix="$(printf '%s' "${dir:a}" | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | cut -c1-8)"
+  [[ -n "$suffix" ]] || suffix="default"
+  print -r -- "${TMPDIR:-/tmp}/claude-auto-window.${suffix}.lastopen"
+}
+
+_caw_mark_opened() {
+  emulate -L zsh
+  print -r -- "$(date +%s)" > "$(_caw_open_marker_path "$1")" 2>/dev/null
+}
+
+# Success (0) if we opened a window within the cooldown window.
+_caw_recently_opened() {
+  emulate -L zsh
+  local dir="$1" cooldown="${CLAUDE_AUTO_WINDOW_OPEN_COOLDOWN_SECONDS:-900}" marker t
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_OPEN_COOLDOWN_SECONDS "$cooldown" || return 1
+  marker="$(_caw_open_marker_path "$dir")"
+  [[ -r "$marker" ]] || return 1
+  t="$(<"$marker")"; [[ "$t" == <-> ]] || return 1
+  (( $(date +%s) - t < cooldown ))
+}
+
+# ----------------------------------------------------------------------------
+# Circuit breaker — stop an endless loop. If we keep firing starters but the
+# window never registers as open (a real fault, or pathological endpoint lag),
+# we'd otherwise re-fire forever. So: count consecutive opens that never confirm;
+# after CLAUDE_AUTO_WINDOW_MAX_FAILURES (default 3) we TRIP — notify + refuse to
+# run until manually reset. The trip is a persistent file so a cron job no-ops
+# and a restarted daemon stays stopped. Counter resets whenever a window is
+# confirmed open. State lives in a durable dir (survives reboot), unlike the
+# transient tmp lock/cooldown markers.
+# ----------------------------------------------------------------------------
+_caw_state_dir() {
+  emulate -L zsh
+  print -r -- "${CLAUDE_AUTO_WINDOW_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/claude-auto-window}"
+}
+
+_caw_state_file() {   # $1 = config dir, $2 = short name
+  emulate -L zsh
+  local dir="$1" name="$2" suffix
+  suffix="$(printf '%s' "${dir:a}" | { shasum -a 256 2>/dev/null || sha256sum 2>/dev/null; } | cut -c1-8)"
+  [[ -n "$suffix" ]] || suffix="default"
+  print -r -- "$(_caw_state_dir)/${suffix}.${name}"
+}
+
+_caw_breaker_count() {
+  emulate -L zsh
+  local f n; f="$(_caw_state_file "$1" failcount)"
+  [[ -r "$f" ]] && n="$(<"$f")"; [[ "$n" == <-> ]] || n=0
+  print -r -- "$n"
+}
+
+_caw_breaker_inc() {
+  emulate -L zsh
+  local f n; f="$(_caw_state_file "$1" failcount)"
+  mkdir -p "${f:h}" 2>/dev/null
+  n=$(( $(_caw_breaker_count "$1") + 1 ))
+  print -r -- "$n" > "$f" 2>/dev/null
+  print -r -- "$n"
+}
+
+_caw_breaker_reset() {   # clear the consecutive-failure counter (window healthy)
+  emulate -L zsh
+  rm -f "$(_caw_state_file "$1" failcount)" 2>/dev/null
+}
+
+_caw_breaker_trip() {    # $2 = reason
+  emulate -L zsh
+  local f; f="$(_caw_state_file "$1" tripped)"
+  mkdir -p "${f:h}" 2>/dev/null
+  print -r -- "$(date '+%Y-%m-%d %H:%M:%S') $2" > "$f" 2>/dev/null
+}
+
+_caw_breaker_tripped() { emulate -L zsh; [[ -e "$(_caw_state_file "$1" tripped)" ]]; }
+_caw_breaker_reason()  { emulate -L zsh; local f; f="$(_caw_state_file "$1" tripped)"; [[ -r "$f" ]] && cat "$f" 2>/dev/null; }
+_caw_breaker_clear()   { emulate -L zsh; rm -f "$(_caw_state_file "$1" tripped)" "$(_caw_state_file "$1" failcount)" 2>/dev/null; }
+
+# Fire an operator notification, if a hook command is configured. The message is
+# passed both on stdin and as $CLAUDE_AUTO_WINDOW_MESSAGE, so hooks can use either
+# (mail/ntfy read stdin; notify-send/osascript reference the env var).
+_caw_notify() {
+  emulate -L zsh
+  local msg="$1"
+  [[ -n "${CLAUDE_AUTO_WINDOW_NOTIFY_CMD:-}" ]] || return 0
+  print -r -- "$msg" | CLAUDE_AUTO_WINDOW_MESSAGE="$msg" sh -c "$CLAUDE_AUTO_WINDOW_NOTIFY_CMD" 2>/dev/null
+}
+
+# ----------------------------------------------------------------------------
+# The core: drive a real interactive Claude session inside a throwaway tmux
+# session, wait for the reply, quit cleanly, tear it down.
+# ----------------------------------------------------------------------------
+# Wait until the expected reply token appears at least $count times in the pane.
+# The prompt itself is echoed in Claude's input box, so it contributes one
+# occurrence; the reply contributes another — hence the default threshold of 2.
+#
+# Also self-bootstraps the workspace-trust dialog: an interactive TTY (which a
+# tmux pane is) shows "Do you trust the files in this folder?" on the first run
+# in a new dir. We accept it by sending Enter (option 1, "Yes, proceed", is the
+# highlighted default). Safe here because the starter dir is a dedicated empty
+# directory the operator owns — override the keys with CLAUDE_AUTO_WINDOW_TRUST_KEYS.
+_caw_wait_reply() {
+  emulate -L zsh
+  local sock="$1" sess="$2" timeout="$3" expect="$4" prompt="$5" count="${6:-1}"
+  local deadline=$(( $(date +%s) + timeout )) pane body n trusted=0
+  local -a trust_keys=( ${=CLAUDE_AUTO_WINDOW_TRUST_KEYS:-Enter} )
+
+  # The prompt text (everything up to the expected token) is echoed in the input
+  # box / rendered as the user turn — and it contains the expected token itself
+  # (e.g. "…: OK."). Filter those lines out so we only match Claude's own reply.
+  local prefix="${prompt%%${expect}*}"
+
+  while (( $(date +%s) < deadline )); do
+    # Session gone unexpectedly (crash / early exit) → give up.
+    tmux -L "$sock" has-session -t "$sess" 2>/dev/null || return 2
+    pane="$(tmux -L "$sock" capture-pane -p -t "$sess" 2>/dev/null)"
+
+    # Accept the trust dialog once, if it appears (first run in a new dir).
+    if (( ! trusted )) && \
+       print -r -- "$pane" | grep -qiE 'trust the files in this folder|Do you trust|Yes, (proceed|I trust)' 2>/dev/null; then
+      _caw_log INFO "Accepting workspace-trust dialog for the starter dir"
+      tmux -L "$sock" send-keys -t "$sess" "${trust_keys[@]}" 2>/dev/null
+      trusted=1
+      sleep 1
+      continue
+    fi
+
+    # Count the expected token only in lines that are NOT the prompt echo.
+    if [[ -n "$prefix" ]]; then
+      body="$(print -r -- "$pane" | grep -vF -- "$prefix" 2>/dev/null)"
+    else
+      body="$pane"
+    fi
+    n="$(print -r -- "$body" | grep -F -c -- "$expect" 2>/dev/null)"
+    [[ "$n" == <-> ]] || n=0
+    (( n >= count )) && return 0
+    sleep 2
+  done
+  return 1
+}
+
+# Quit Claude gracefully (/exit), fall back to Ctrl-C, then kill the session.
+_caw_quit_and_kill() {
+  emulate -L zsh
+  local sock="$1" sess="$2" i cur
+  tmux -L "$sock" send-keys -t "$sess" -- "/exit" Enter 2>/dev/null
+  for i in {1..8}; do
+    sleep 1
+    tmux -L "$sock" has-session -t "$sess" 2>/dev/null || return 0   # already gone
+    cur="$(tmux -L "$sock" display-message -p -t "$sess" '#{pane_current_command}' 2>/dev/null)"
+    case "$cur" in
+      *zsh|*bash|*sh|-zsh|-bash) break ;;   # back to a shell → claude has exited
+    esac
+    (( i == 3 )) && tmux -L "$sock" send-keys -t "$sess" C-c C-c 2>/dev/null
+  done
+  tmux -L "$sock" kill-session -t "$sess" 2>/dev/null
+}
+
+# Send exactly one interactive starter.
+#   $1 = check dir, $2 = show output (1/0), $3 = model (optional; "" = account
+#   default / no --model). When $3 is omitted, CLAUDE_AUTO_WINDOW_MODEL is used
+#   (default: the "haiku" alias — cheapest tier, always the latest version).
+_caw_send_starter() {
+  emulate -L zsh
+  local dir="$1" show="${2:-0}" model
+  if (( $# >= 3 )); then model="$3"; else model="${CLAUDE_AUTO_WINDOW_MODEL-haiku}"; fi
+  local claude_bin prompt starter_dir sock sess expect count reply_timeout
+  claude_bin="$(_caw_resolve_claude_bin)" || return $?
+
+  command -v tmux >/dev/null 2>&1 || { _caw_log ERROR "tmux not found on PATH"; return 2; }
+
+  prompt="${CLAUDE_AUTO_WINDOW_PROMPT:-Reply with exactly: OK.}"
+  # Default to a stable per-user tmp dir: isolated from the work cwd, always
+  # empty (transcripts are cleaned), and trusted exactly once — so it adds a
+  # single ~/.claude.json trust entry, not one per run. Re-trusted automatically
+  # if a reboot clears tmp. Override with --starter-dir for a fixed location.
+  starter_dir="${CLAUDE_AUTO_WINDOW_STARTER_DIR:-${${TMPDIR:-/tmp}%/}/claude-auto-window-${UID}}"
+  sock="${CLAUDE_AUTO_WINDOW_TMUX_SOCKET:-claude-auto-window}"
+  expect="${CLAUDE_AUTO_WINDOW_EXPECT:-OK.}"
+  count="${CLAUDE_AUTO_WINDOW_EXPECT_COUNT:-1}"   # prompt echo is filtered out
+  reply_timeout="${CLAUDE_AUTO_WINDOW_REPLY_TIMEOUT_SECONDS:-120}"
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_EXPECT_COUNT "$count" || return $?
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_REPLY_TIMEOUT_SECONDS "$reply_timeout" || return $?
+
+  mkdir -p "$starter_dir" || { _caw_log ERROR "cannot create starter dir: $starter_dir"; return 1; }
+
+  # Unique tmux session name + a pinned session id we can delete afterward.
+  sess="caw-$$-$(date +%s)-${RANDOM}"
+  local uuid; uuid="$(_caw_uuid)"
+
+  # Build the command line that runs inside the pane. Strip any API-key env so
+  # the subscription OAuth login is used (an API key would bill separately and
+  # not anchor the subscription window); skip prompt history. Pin the profile
+  # only when explicitly selected.
+  local -a launch
+  launch=( env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_SKIP_PROMPT_HISTORY=1 )
+  _caw_launch_profile_pinned && launch+=( "CLAUDE_CONFIG_DIR=$dir" )
+  launch+=( "$claude_bin" )
+
+  # Lightest possible context (opt out with CLAUDE_AUTO_WINDOW_LIGHT=0):
+  #   --safe-mode   strip CLAUDE.md/memory, skills, hooks, MCP, plugins, agents,
+  #                 output styles, themes, keybindings — OAuth auth still works.
+  #   --tools ""    no built-in tool schemas in the context.
+  #   --exclude-dynamic-system-prompt-sections  trim per-machine prompt sections.
+  if [[ "${CLAUDE_AUTO_WINDOW_LIGHT:-1}" == 1 ]]; then
+    launch+=( --safe-mode --tools "" --exclude-dynamic-system-prompt-sections )
+  fi
+  [[ -n "$uuid" ]] && launch+=( --session-id "$uuid" )
+  [[ -n "$model" ]] && launch+=( --model "$model" )
+  launch+=( "$prompt" )
+
+  # Run claude directly as the pane's process (tmux execs it via `sh -c`) rather
+  # than typing it into an interactive shell. That avoids a shell command-echo
+  # in the pane — which would contain the prompt text ("…OK.") and defeat reply
+  # detection. `exec` makes claude the pane's foreground process.
+  local paneline="cd ${(q)starter_dir} && exec ${(j: :)${(@q)launch}}"
+
+  _caw_log INFO "Opening tmux starter session '$sess' (socket '$sock', model '${model:-<account default>}')"
+  if ! tmux -L "$sock" new-session -d -s "$sess" -x 220 -y 50 "$paneline" 2>/dev/null; then
+    _caw_log ERROR "failed to create tmux session"
+    return 1
+  fi
+
+  {
+    if _caw_wait_reply "$sock" "$sess" "$reply_timeout" "$expect" "$prompt" "$count"; then
+      _caw_log INFO "Claude replied ('$expect' x$count seen); closing session"
+      (( show )) && tmux -L "$sock" capture-pane -p -t "$sess" 2>/dev/null
+    else
+      _caw_log WARN "no reply within ${reply_timeout}s (auth issue or a blocking prompt?)"
+      (( show )) && tmux -L "$sock" capture-pane -p -t "$sess" 2>/dev/null
+      return 4     # teardown happens in the always block below
+    fi
+  } always {
+    _caw_quit_and_kill "$sock" "$sess"
+    _caw_cleanup_transcript "$dir" "$uuid"
+  }
+  return 0
+}
+
+# Send a starter with the preferred (cheapest) model, falling back once to the
+# account default model if that model got no reply — covers the rare case where
+# the configured model/alias has been retired.
+_caw_open_window() {
+  emulate -L zsh
+  local dir="$1" show="$2" rc primary
+  primary="${CLAUDE_AUTO_WINDOW_MODEL-haiku}"
+  _caw_send_starter "$dir" "$show" "$primary"; rc=$?
+  if (( rc == 4 )) && [[ -n "$primary" ]]; then
+    _caw_log WARN "no reply with model '$primary' (retired?); retrying on the account default model"
+    _caw_send_starter "$dir" "$show" ""; rc=$?
+  fi
+  # Reply received ⇒ the request completed ⇒ a window is open. Stamp the cooldown
+  # marker so the daemon doesn't re-open during the endpoint's propagation lag.
+  (( rc == 0 )) && _caw_mark_opened "$dir"
+  return $rc
+}
+
+# Best-effort confirmation that the window opened. The received reply is already
+# proof the request completed (which is what opens the window); the usage
+# endpoint can lag a few minutes before it reflects that. So this is purely
+# informational and NEVER fails the run just because the endpoint hasn't caught
+# up yet — a genuine no-reply failure is already returned by _caw_send_starter.
+_caw_verify_started() {
+  emulate -L zsh
+  local dir="$1"
+  local delay="${CLAUDE_AUTO_WINDOW_VERIFY_DELAY_SECONDS:-3}"
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_VERIFY_DELAY_SECONDS "$delay" || return 0
+  (( delay > 0 )) && sleep "$delay"
+  if _caw_session_active "$dir"; then
+    _caw_log INFO "Five-hour window confirmed open for $dir"
+  else
+    _caw_log INFO "Starter reply received (request completed → window opened); the usage endpoint hasn't reflected it yet — it can lag a few minutes. Treating as success."
+  fi
+  return 0
+}
+
+# ============================================================================
+# Public entry points
+# ============================================================================
+
+# Immediately fire one starter — no checks, no jitter.
+claude-auto-window-run() {
+  emulate -L zsh
+  local dir lock rc verify="${CLAUDE_AUTO_WINDOW_VERIFY:-1}"
+  dir="$(_caw_check_dir)"
+  lock="$(_caw_acquire_lock "$dir")"; rc=$?
+  (( rc == 75 )) && { _caw_log WARN "another claude-auto-window is running for $dir"; return 75; }
+  (( rc != 0 )) && return "$rc"
+  {
+    # The only guard in --run: refuse if this account has NO 5-hour window at all
+    # (usage-billed/API seat), since firing there just spends money for nothing.
+    # Fail-open on everything else (active/closed/undetermined) so --run stays the
+    # "just do it" path. --force / CLAUDE_AUTO_WINDOW_FORCE=1 bypasses even this.
+    if [[ "${CLAUDE_AUTO_WINDOW_FORCE:-0}" != 1 ]]; then
+      _caw_session_active "$dir"; rc=$?
+      if (( rc == 2 )); then
+        _caw_log WARN "No 5-hour session window on this account ($dir) — refusing to fire (would spend money for no benefit). Use --force to override."
+        return 70
+      fi
+    fi
+    _caw_log INFO "run mode: firing one starter (no checks, no jitter)"
+    _caw_open_window "$dir" 1 || return $?
+    (( verify )) && _caw_verify_started "$dir"
+  } always {
+    _caw_release_lock "$lock"
+  }
+}
+
+# Guarded cycle: check the window; only if none is open, jitter then fire.
+claude-auto-window-once() {
+  emulate -L zsh
+  local dir lock rc
+  local jitter_max="${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}"
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS "$jitter_max" || return $?
+  dir="$(_caw_check_dir)"
+
+  lock="$(_caw_acquire_lock "$dir")"; rc=$?
+  (( rc == 75 )) && return 0     # someone else has it; nothing to do
+  (( rc != 0 )) && return "$rc"
+
+  {
+    # Circuit breaker already tripped by a prior run → refuse to run until reset.
+    # (No re-notify here; the notification fired when it tripped.)
+    if _caw_breaker_tripped "$dir"; then
+      _caw_log ERROR "Disabled by sentinel $(_caw_state_file "$dir" tripped) ($(_caw_breaker_reason "$dir")) — not running. Re-enable: claude-auto-window --reset"
+      return 3
+    fi
+
+    _caw_session_active "$dir"; rc=$?
+    if (( rc == 0 )); then
+      _caw_breaker_reset "$dir"         # window confirmed open → healthy, clear the counter
+      _caw_log INFO "Window already open for $dir; nothing to do"
+      return 0
+    elif (( rc == 2 )); then
+      _caw_log WARN "No 5-hour session window on this account ($dir) — nothing to keep open. If this is an API/usage-billed seat, don't run claude-auto-window (it would spend money for no benefit)."
+      return 70                         # sentinel: no window on this account (not an error)
+    elif (( rc == 3 )); then
+      _caw_log ERROR "Could not determine window state for $dir"
+      return 1
+    fi
+
+    # Endpoint-lag guard: the usage endpoint takes a few minutes to reflect a
+    # freshly opened window, reading "closed" in the meantime. If we opened one
+    # very recently, don't fire another starter conversation (the window is
+    # already open — a repeat would just waste usage); wait for the endpoint.
+    if _caw_recently_opened "$dir"; then
+      _caw_log INFO "Opened a window recently; the usage endpoint may still be catching up — skipping"
+      return 0
+    fi
+
+    # Window is closed. Guard against a spent weekly allowance before spending.
+    local json; json="$(_caw_usage_json "$dir")"
+    if _caw_weekly_exhausted "$json"; then
+      _caw_log WARN "Weekly allowance exhausted; skipping starter"
+      return 0
+    fi
+
+    # Jitter: we know we must open one, but wait 0..max first so many hosts /
+    # cron ticks don't stampede the endpoint at the same instant.
+    local delay; delay="$(_caw_random "$jitter_max")"
+    if (( delay > 0 )); then
+      _caw_log INFO "Window closed; jittering ${delay}s (max ${jitter_max}s) before starter"
+      sleep "$delay"
+    fi
+
+    # Normal activity during the jitter may already have opened the next window.
+    _caw_session_active "$dir" && {
+      _caw_breaker_reset "$dir"
+      _caw_log INFO "Window opened during jitter (normal activity); no starter needed"
+      return 0
+    }
+    json="$(_caw_usage_json "$dir")"
+    _caw_weekly_exhausted "$json" && {
+      _caw_log WARN "Weekly allowance became exhausted during jitter; skipping starter"
+      return 0
+    }
+
+    # Circuit breaker: if the last few opens never registered a window (endpoint
+    # never showed it open), stop instead of looping forever. Notify + trip.
+    local fails max="${CLAUDE_AUTO_WINDOW_MAX_FAILURES:-3}"
+    _caw_validate_uint CLAUDE_AUTO_WINDOW_MAX_FAILURES "$max" || return $?
+    fails="$(_caw_breaker_count "$dir")"
+    if (( fails >= max )); then
+      local reason="${fails} consecutive opens did not register a 5-hour window"
+      local sentinel; sentinel="$(_caw_state_file "$dir" tripped)"
+      _caw_breaker_trip "$dir" "$reason"
+      _caw_log ERROR "Circuit breaker TRIPPED for $dir: $reason. Disabled via sentinel: $sentinel. Re-enable with: claude-auto-window --reset (or: rm $sentinel)"
+      _caw_notify "claude-auto-window DISABLED for $dir: $reason.
+
+The tool has stopped itself to avoid a wasteful loop and will not run again until re-enabled.
+Sentinel file: $sentinel
+Re-enable with:  claude-auto-window --reset
+(or simply:      rm $sentinel)"
+      return 3
+    fi
+
+    _caw_breaker_inc "$dir" >/dev/null   # count this attempt; reset happens once a window is confirmed open
+    _caw_open_window "$dir" 0 || return $?
+    _caw_verify_started "$dir"
+  } always {
+    _caw_release_lock "$lock"
+  }
+}
+
+# Daemon: run the guarded cycle on a fixed cadence. Ticks stay aligned to the
+# daemon start; a cycle that overruns (jitter) skips missed ticks rather than
+# queueing them.
+claude-auto-window-daemon() {
+  emulate -L zsh
+  local interval="${CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS:-300}"
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS "$interval" || return $?
+  (( interval >= 1 )) || { _caw_log ERROR "interval must be >= 1"; return 2; }
+
+  # Fail fast on persistent config errors so systemd's restart policy sees them.
+  _caw_resolve_claude_bin >/dev/null || return $?
+
+  local stop=0
+  trap 'stop=1' INT TERM HUP
+
+  _caw_log INFO "Daemon up: poll every ${interval}s, jitter 0-${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}s"
+  local next now rc
+  now="$(date +%s)"; next="$now"
+  while (( ! stop )); do
+    claude-auto-window-once; rc=$?
+    if (( rc == 2 )); then
+      _caw_log ERROR "Fatal configuration error; daemon exiting"
+      return "$rc"
+    elif (( rc == 70 )); then
+      _caw_log WARN "This account has no 5-hour window to keep open — daemon exiting (nothing to do)."
+      return 0                        # clean exit → systemd leaves it stopped, no restart loop
+    elif (( rc == 3 )); then
+      _caw_log ERROR "Circuit breaker tripped — daemon exiting to avoid a loop. Reset with: claude-auto-window --reset"
+      return 0                        # clean exit; the persistent trip file keeps it stopped across restarts
+    elif (( rc != 0 && rc != 75 )); then
+      _caw_log WARN "Cycle failed (status $rc); retrying next tick"
+    fi
+    next=$(( next + interval ))
+    now="$(date +%s)"
+    while (( next <= now )); do next=$(( next + interval )); done
+    (( stop )) || sleep $(( next - now )) || true
+  done
+  _caw_log INFO "Daemon stopped"
+  return 0
+}
+
+claude-auto-window-status() {
+  emulate -L zsh
+  _caw_status_line "$(_caw_check_dir)"
+}
+
+# ----------------------------------------------------------------------------
+# Profile-name → config dir mapping for --profile.
+# ----------------------------------------------------------------------------
+_caw_apply_profile() {
+  emulate -L zsh
+  local name="$1"
+  case "$name" in
+    ""|default)  return 0 ;;                                            # let Claude resolve ~/.claude
+    personal)    typeset -gx CLAUDE_AUTO_WINDOW_CONFIG_DIR="$HOME/.claude-personal" ;;
+    work)        typeset -gx CLAUDE_AUTO_WINDOW_CONFIG_DIR="$HOME/.claude" ;;
+    /*)          typeset -gx CLAUDE_AUTO_WINDOW_CONFIG_DIR="$name" ;;   # absolute path
+    *)           _caw_log ERROR "unknown --profile '$name' (use default|personal|work|<abs path>)"; return 2 ;;
+  esac
+}
+
+_caw_usage_text() {
+  cat <<'USAGE'
+claude-auto-window — keep a Claude five-hour window perpetually open (tmux-driven)
+
+Usage:
+  claude-auto-window [--once]            # check window; if closed, jitter + open (default)
+  claude-auto-window --run               # open one now, no checks, no jitter
+  claude-auto-window --daemon            # loop --once on a fixed interval
+  claude-auto-window --status            # print current five-hour session state
+  claude-auto-window --reset             # clear a tripped circuit breaker
+
+Profile:
+  --config-dir PATH        Explicit Claude profile dir (pins CLAUDE_CONFIG_DIR)
+  --profile NAME           default | personal | work | <abs path>
+                           (default = let Claude Code resolve ~/.claude)
+
+Tuning (all also settable via CLAUDE_AUTO_WINDOW_* env):
+  --interval SEC           Daemon poll interval.               Default: 300
+  --jitter-max SEC         Max wait before opening a window.   Default: 180
+  --reply-timeout SEC      How long to wait for the reply.     Default: 120
+  --verify-delay SEC       Delay before post-open verify.      Default: 3
+  --prompt TEXT            Starter prompt. Default: "Reply with exactly: OK."
+  --expect TEXT            Reply token to look for.            Default: "OK."
+  --expect-count N         Reply occurrences required, after the prompt-echo
+                           lines are filtered out.             Default: 1
+  --model MODEL            Model alias or id. Default: haiku (cheapest tier,
+                           alias tracks the latest version). "" = account
+                           default. Falls back to the account default if the
+                           chosen model has been retired.
+  --starter-dir PATH       Working dir for the starter (isolated from the work
+                           cwd). Default: $TMPDIR/claude-auto-window-<uid>.
+  --claude-bin PATH        Absolute path to the claude executable.
+  --tmux-socket NAME       Isolated tmux socket name (-L).     Default: claude-auto-window
+  --log PATH               Also append logs here (stdout/stderr always on).
+  --no-verify              Skip the post-open window verification.
+  --quiet                  Suppress console output (log to --log file only).
+                           Use for cron so it doesn't email on every run; rely
+                           on --notify-cmd for the trip alert.
+  --force                  With --run, fire even on an account that has no
+                           5-hour window (bypasses the only --run safety check).
+  --max-failures N         Consecutive opens that never register a window before
+                           the circuit breaker trips + stops.        Default: 3
+  --notify-cmd CMD         Shell command run when the breaker trips (message on
+                           stdin and in $CLAUDE_AUTO_WINDOW_MESSAGE). e.g. a
+                           notify-send / mail / ntfy / osascript one-liner.
+  -h, --help               Show this help.
+  -v, --version            Show version.
+
+Source-able API:
+  source ./claude-auto-window
+  claude-auto-window-run | -once | -daemon | -status
+USAGE
+}
+
+# ----------------------------------------------------------------------------
+# CLI entrypoint — maps flags onto the CLAUDE_AUTO_WINDOW_* env the funcs read.
+# ----------------------------------------------------------------------------
+_caw_main() {
+  emulate -L zsh
+  setopt local_options
+
+  local mode="once" mode_set=0 profile="" config_dir=""
+  while (( $# )); do
+    case "$1" in
+      --run|--open-now)  [[ $mode_set == 1 && $mode != run ]] && { print -u2 "pick one mode"; return 2; }; mode=run; mode_set=1 ;;
+      --once)            [[ $mode_set == 1 && $mode != once ]] && { print -u2 "pick one mode"; return 2; }; mode=once; mode_set=1 ;;
+      --daemon)          [[ $mode_set == 1 && $mode != daemon ]] && { print -u2 "pick one mode"; return 2; }; mode=daemon; mode_set=1 ;;
+      --status)          [[ $mode_set == 1 && $mode != status ]] && { print -u2 "pick one mode"; return 2; }; mode=status; mode_set=1 ;;
+      --reset)           [[ $mode_set == 1 && $mode != reset ]] && { print -u2 "pick one mode"; return 2; }; mode=reset; mode_set=1 ;;
+      --no-verify)       typeset -gx CLAUDE_AUTO_WINDOW_VERIFY=0 ;;
+      --quiet)           typeset -gx CLAUDE_AUTO_WINDOW_QUIET=1 ;;
+      --force)           typeset -gx CLAUDE_AUTO_WINDOW_FORCE=1 ;;
+      --max-failures)    typeset -gx CLAUDE_AUTO_WINDOW_MAX_FAILURES="$2"; shift ;;
+      --max-failures=*)  typeset -gx CLAUDE_AUTO_WINDOW_MAX_FAILURES="${1#*=}" ;;
+      --notify-cmd)      typeset -gx CLAUDE_AUTO_WINDOW_NOTIFY_CMD="$2"; shift ;;
+      --notify-cmd=*)    typeset -gx CLAUDE_AUTO_WINDOW_NOTIFY_CMD="${1#*=}" ;;
+      --profile)         profile="$2"; shift ;;
+      --profile=*)       profile="${1#*=}" ;;
+      --config-dir)      config_dir="$2"; shift ;;
+      --config-dir=*)    config_dir="${1#*=}" ;;
+      --interval)        typeset -gx CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS="$2"; shift ;;
+      --interval=*)      typeset -gx CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS="${1#*=}" ;;
+      --jitter-max)      typeset -gx CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS="$2"; shift ;;
+      --jitter-max=*)    typeset -gx CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS="${1#*=}" ;;
+      --reply-timeout)   typeset -gx CLAUDE_AUTO_WINDOW_REPLY_TIMEOUT_SECONDS="$2"; shift ;;
+      --reply-timeout=*) typeset -gx CLAUDE_AUTO_WINDOW_REPLY_TIMEOUT_SECONDS="${1#*=}" ;;
+      --verify-delay)    typeset -gx CLAUDE_AUTO_WINDOW_VERIFY_DELAY_SECONDS="$2"; shift ;;
+      --verify-delay=*)  typeset -gx CLAUDE_AUTO_WINDOW_VERIFY_DELAY_SECONDS="${1#*=}" ;;
+      --prompt)          typeset -gx CLAUDE_AUTO_WINDOW_PROMPT="$2"; shift ;;
+      --prompt=*)        typeset -gx CLAUDE_AUTO_WINDOW_PROMPT="${1#*=}" ;;
+      --expect)          typeset -gx CLAUDE_AUTO_WINDOW_EXPECT="$2"; shift ;;
+      --expect=*)        typeset -gx CLAUDE_AUTO_WINDOW_EXPECT="${1#*=}" ;;
+      --expect-count)    typeset -gx CLAUDE_AUTO_WINDOW_EXPECT_COUNT="$2"; shift ;;
+      --expect-count=*)  typeset -gx CLAUDE_AUTO_WINDOW_EXPECT_COUNT="${1#*=}" ;;
+      --model)           typeset -gx CLAUDE_AUTO_WINDOW_MODEL="$2"; shift ;;
+      --model=*)         typeset -gx CLAUDE_AUTO_WINDOW_MODEL="${1#*=}" ;;
+      --starter-dir)     typeset -gx CLAUDE_AUTO_WINDOW_STARTER_DIR="$2"; shift ;;
+      --starter-dir=*)   typeset -gx CLAUDE_AUTO_WINDOW_STARTER_DIR="${1#*=}" ;;
+      --claude-bin)      typeset -gx CLAUDE_AUTO_WINDOW_CLAUDE_BIN="$2"; shift ;;
+      --claude-bin=*)    typeset -gx CLAUDE_AUTO_WINDOW_CLAUDE_BIN="${1#*=}" ;;
+      --tmux-socket)     typeset -gx CLAUDE_AUTO_WINDOW_TMUX_SOCKET="$2"; shift ;;
+      --tmux-socket=*)   typeset -gx CLAUDE_AUTO_WINDOW_TMUX_SOCKET="${1#*=}" ;;
+      --log)             typeset -gx CLAUDE_AUTO_WINDOW_LOG="$2"; shift ;;
+      --log=*)           typeset -gx CLAUDE_AUTO_WINDOW_LOG="${1#*=}" ;;
+      -h|--help)         _caw_usage_text; return 0 ;;
+      -v|--version)      print -r -- "claude-auto-window $CLAUDE_AUTO_WINDOW_VERSION"; return 0 ;;
+      --)                shift; break ;;
+      *)                 print -u2 "claude-auto-window: unknown argument: $1 (see --help)"; return 2 ;;
+    esac
+    shift
+  done
+
+  # --config-dir wins over --profile; both set the same env the funcs read.
+  if [[ -n "$config_dir" ]]; then
+    typeset -gx CLAUDE_AUTO_WINDOW_CONFIG_DIR="${config_dir%/}"
+  elif [[ -n "$profile" ]]; then
+    _caw_apply_profile "$profile" || return $?
+  fi
+
+  case "$mode" in
+    run)    claude-auto-window-run ;;
+    once)   claude-auto-window-once ;;
+    daemon) claude-auto-window-daemon ;;
+    status) claude-auto-window-status ;;
+    reset)  claude-auto-window-reset ;;
+  esac
+}
+
+# Keep a stable public alias for the default (guarded) cycle.
+claude-auto-window() { claude-auto-window-once "$@"; }
+
+# Run the CLI only when executed directly, not when sourced.
+# ZSH_EVAL_CONTEXT contains ':file' when this file is being sourced.
+case ":${ZSH_EVAL_CONTEXT:-}:" in
+  *:file:*) ;;                       # sourced → just define functions
+  *) _caw_main "$@"; exit $? ;;      # executed → run CLI
+esac
