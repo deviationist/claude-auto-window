@@ -16,6 +16,7 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
 | File | Role |
 |---|---|
 | `claude-auto-window` | The whole tool — one self-contained script (OAuth read + usage fetch inlined). Executable **and** source-able. |
+| `claude-auto-window.env.example` → config | Auto-loaded from `$XDG_CONFIG_HOME/claude-auto-window/config` in `_caw_main` (`_caw_load_config`); fills only unset `CLAUDE_AUTO_WINDOW_*` vars (env/flags win). |
 | `claude-auto-window@.service` | systemd `--user` template (Linux daemon), keyed on profile via `%i`. |
 | `claude-auto-window.plist` | launchd template (macOS daemon), `__HOME__` placeholders. |
 | `claude-auto-window.env.example` | Every `CLAUDE_AUTO_WINDOW_*` knob. |
@@ -28,7 +29,11 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
   - `claude-auto-window-run` — fire immediately, **no checks, no jitter**.
   - `claude-auto-window-once` *(default)* — check window; if closed, **jitter**
     then open. Guards: already-open, weekly-exhausted, no-5h-window.
-  - `claude-auto-window-daemon` — loop `-once` on a fixed interval (aligned ticks).
+  - `claude-auto-window-daemon` — loop `-once`, then **sleep adaptively**: if a
+    window is open (`_CAW_RESET_AT` set by `_caw_session_active`), sleep until
+    ~one INTERVAL before `resets_at` (capped at `MAX_SLEEP`); else poll at the
+    fine INTERVAL (confirm a just-opened window / count down the last interval).
+    No continuous polling. Cron can't do this — it polls on its crontab cadence.
   - `claude-auto-window-status` — print the current session state.
 - **Both `-run` and `-once` open a window via** `_caw_open_window` → which calls
   `_caw_send_starter` and adds the **cheapest-model-with-fallback** retry.
@@ -74,9 +79,12 @@ functions are the `claude-auto-window*` names.
   daemon exits cleanly, cron no-ops, both stay stopped across restarts until
   `--reset`). The counter **resets on a confirmed-open cycle** and increments
   **once per fire attempt** (post-cooldown, post-weekly-guard) — keep it that way,
-  or normal operation would false-trip or a fault would never trip. State is in a
-  **durable** dir (`CLAUDE_AUTO_WINDOW_STATE_DIR`), separate from the transient
-  tmp lock/cooldown markers, so a persistent fault survives reboots.
+  or normal operation would false-trip or a fault would never trip. Runtime state
+  lives in a **durable** dir (`$XDG_STATE_HOME/claude-auto-window/`): a per-profile
+  `<hash>.state` key=value file (`_caw_state_get/set/del`) holds `failcount`,
+  `last_open` (cooldown), `resets_at`, and `profile`; the disable **sentinel**
+  (`<hash>.tripped`) is deliberately kept as its **own** file (touch/rm
+  kill-switch). Only the process lock stays transient in `$TMPDIR`.
 - **No 5h window ⇒ do nothing.** `_caw_session_active` returns **2** when the
   account has no `session` limit (API/usage-billed seat). `-once` turns that into
   exit **70** (safe no-op, never "closed → open" — that would spend money per
