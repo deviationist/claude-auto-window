@@ -201,7 +201,7 @@ Every flag has a `CLAUDE_AUTO_WINDOW_*` env equivalent (see
 |---|---|---|---|
 | `--interval` | `…_INTERVAL_SECONDS` | 60 | Daemon **confirm-poll** interval (post-open) |
 | `--post-expiry` | `…_POST_EXPIRY_SECONDS` | 5 | Wake this long after expiry to fire |
-| `--max-sleep` | `…_MAX_SLEEP_SECONDS` | 21600 | Cap on one adaptive sleep |
+| `--max-sleep` | `…_MAX_SLEEP_SECONDS` | 21600 | Cap on one sleep (safety) |
 | `--jitter-max` | `…_JITTER_MAX_SECONDS` | 180 | Extra 0..N wait before firing (small on a daemon) |
 | `--model` | `…_MODEL` | `haiku` | Model alias/id, `""` = account default |
 | `--max-failures` | `…_MAX_FAILURES` | 3 | Failed opens before the breaker trips |
@@ -210,8 +210,8 @@ Every flag has a `CLAUDE_AUTO_WINDOW_*` env equivalent (see
 ## Running it continuously
 
 Pick your platform × style. In all cases, symlink the script to
-`~/.local/bin/claude-auto-window` first (see *Install*). The daemon sleeps
-adaptively (above); a cron entry runs `--once` on a schedule instead.
+`~/.local/bin/claude-auto-window` first (see *Install*). The daemon sleeps until
+window expiry (above); a cron entry runs `--once` on a schedule instead.
 
 ### Linux — systemd `--user` (daemon)
 
@@ -238,13 +238,20 @@ journalctl --user -u claude-auto-window@default -f    # logs
 crontab -e
 ```
 ```cron
-# poll every 5 min; the script jitters + opens only when the window is closed.
-# --quiet so cron doesn't email on every routine run; --notify-cmd is the alert.
-*/5 * * * * $HOME/.local/bin/claude-auto-window --once --quiet \
+# run every minute — each run exits early (no fetch) while the stored resets_at is
+# still in the future, so it only hits the endpoint near expiry. Running every
+# minute keeps reopening tight (fires within ~1 min of the window lapsing).
+# --quiet so cron doesn't email on every run; --notify-cmd is the alert.
+* * * * * $HOME/.local/bin/claude-auto-window --once --quiet \
   --log $HOME/.local/state/claude-auto-window/default.log \
   --notify-cmd 'mail -s "claude-auto-window tripped" you@example.com'
 ```
 Notes:
+- **Cheap even every minute.** Cron can't sleep, so it fires on schedule — but each
+  run first reads the stored `resets_at` and **exits without fetching** while the
+  window is still open. It only actually checks near expiry (and briefly after
+  opening, to confirm). So a per-minute crontab still costs ~2 requests per 5-hour
+  window, not one per tick. (`--status` always does a live check if you want one.)
 - **`--quiet` matters for cron.** Without it the script prints on every run and
   cron emails you every 5 minutes. `--quiet` keeps output in the `--log` file;
   the **`--notify-cmd` mailer** is then your single alert (fires once, on a trip).
@@ -274,7 +281,7 @@ macOS ships cron (though launchd is preferred). Same as the Linux cron entry —
 `--quiet` + `--notify-cmd`:
 
 ```cron
-*/5 * * * * $HOME/.local/bin/claude-auto-window --once --quiet \
+* * * * * $HOME/.local/bin/claude-auto-window --once --quiet \
   --log $HOME/.local/state/claude-auto-window/default.log \
   --notify-cmd 'osascript -e "display notification \"$CLAUDE_AUTO_WINDOW_MESSAGE\" with title \"claude-auto-window\""'
 ```
