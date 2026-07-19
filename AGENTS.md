@@ -48,7 +48,12 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
 - **Window check** is `_caw_session_active` → `_caw_usage_json` (inlined:
   `_caw_resolve_token` + a `curl` to the OAuth usage endpoint → raw JSON) →
   `.limits[] | select(.kind=="session")`. "Open" = **`resets_at` in the future**;
-  `is_active` is deliberately NOT consulted (see Gotchas).
+  `is_active` is deliberately NOT consulted (see Gotchas). Internal rc: 0 open,
+  1 closed, 2 no-session-limit, 3 undetermined (network/API), **4 access token
+  expired** — on 4, `-once` self-heals via `_caw_refresh_token` (a bare
+  prompt-less claude launch that refreshes the token for free; see Gotchas),
+  re-checks, and only falls back to firing blind if the refresh launch fails.
+  Only 3 hard-fails.
 
 All private helpers are prefixed **`_caw_`** (claude-auto-window). Public
 functions are the `claude-auto-window*` names.
@@ -143,7 +148,26 @@ per-profile lock.
   (`CLAUDE_AUTO_WINDOW_OPEN_COOLDOWN_SECONDS`, default 900) so the daemon doesn't
   fire redundant starter runs during the blind spot (there's only ever one
   window; re-firing just wastes usage). Don't remove either safeguard.
-- **Trust dialog.** First run in a new starter dir shows the workspace-trust
+- **OAuth access tokens live ~8h; refresh tokens ~3 days** (both stored in the
+  credential blob; only a real `claude` launch performs the refresh — no plumbing
+  command does: `auth status`/`doctor`/`agents --json` are all local-only, and
+  `auth status` even reports `loggedIn: true` on an expired token; all verified
+  empirically 2026-07-20). So after >8h without any Claude activity the state
+  check can't authenticate. That is **not** a hard failure: `_caw_resolve_token`
+  returns 4 ("expired, refreshable") vs 1 ("no credentials"), and `-once`
+  **self-heals** via `_caw_refresh_token` — a **bare, prompt-less** interactive
+  launch in the usual throwaway tmux. The CLI refreshes the token on its first
+  authenticated backend call at startup (~2s, verified 2026-07-20), and a
+  launch with no message **opens no 5h window and spends nothing** — so heal +
+  re-check costs zero. Blind starter fire remains only as the fallback when the
+  refresh launch fails (its send also refreshes; a dead refresh token → no
+  reply → circuit breaker). Don't "fix" any of this by adding an OAuth refresh
+  implementation to the script — reusing the CLI's own refresh was a deliberate
+  no-new-auth-logic decision. Don't collapse rc 4 back into rc 3 (that
+  recreates a cold-start deadlock: check needs a token, token needs a launch,
+  launch never happens because the check fails). And never add a prompt
+  argument to `_caw_refresh_token`'s launch — prompt-less is what makes the
+  self-heal free.
   dialog; `_caw_wait_reply` auto-accepts it (Enter = "Yes, I trust this folder").
   This writes one `~/.claude.json` trust entry per starter dir — which is why the
   default starter dir is a **stable** tmp path, not a fresh one per run.
