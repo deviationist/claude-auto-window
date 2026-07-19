@@ -29,9 +29,11 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
   - `claude-auto-window-run` — fire immediately, **no checks, no jitter**.
   - `claude-auto-window-once` *(default)* — **early-exit gate first**: read the
     stored `resets_at`; if it's still in the future, return 0 WITHOUT fetching
-    (this is what makes a per-minute cron cheap). Otherwise check the window; if
-    closed, **jitter** then open. Guards: already-open, weekly-exhausted,
-    no-5h-window. Not a flag — always on; `--status` is the live-check escape.
+    (this is what makes a per-minute cron cheap). Otherwise check the window —
+    **self-healing an expired access token first** (rc 4 → `_caw_refresh_token`
+    → re-check; blind fire only as fallback) — and if closed, **jitter** then
+    open. Guards: already-open, weekly-exhausted, no-5h-window. Not a flag —
+    always on; `--status` is the live-check escape.
   - `claude-auto-window-daemon` — loop `-once`, then sleep off the **stored
     `resets_at`** (single source of truth, written by `_caw_session_active`): if
     future, sleep until just AFTER expiry (`resets_at + POST_EXPIRY`, capped at
@@ -45,6 +47,10 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
   new-session` running `claude` directly → `_caw_wait_reply` (also auto-accepts
   the trust dialog) → `_caw_quit_and_kill` → `_caw_cleanup_transcript`, the last
   two in an `always {}` block so teardown is guaranteed.
+- **`_caw_refresh_token`** is the free self-heal for an expired access token:
+  the same tmux launch **minus the prompt and model** (nothing sent → no window
+  opened, nothing spent), waiting for `_caw_resolve_token` to turn fresh instead
+  of for a reply; identical trust-dialog handling and teardown.
 - **Window check** is `_caw_session_active` → `_caw_usage_json` (inlined:
   `_caw_resolve_token` + a `curl` to the OAuth usage endpoint → raw JSON) →
   `.limits[] | select(.kind=="session")`. "Open" = **`resets_at` in the future**;
@@ -122,6 +128,15 @@ per-profile lock.
   fake inputs — e.g. feed `_caw_wait_reply`-style pane snapshots to the filter, or
   hand `_caw_session_active` a mocked `_caw_usage_json`. The reply-detection and
   transcript-cleanup logic are fully unit-testable this way.
+- **Live but free — the expired-token self-heal path:** temporarily set the
+  stored credential's `expiresAt` into the past (keep the blob **in shell
+  memory only** — never write it to a file — and mutate just the timestamp;
+  on macOS via `security add-generic-password -U`), then run `--once` while a
+  window is open: expect the self-heal log → "Access token refreshed by the
+  launch" → "Window already open", with nothing fired. The bare launch spends
+  nothing, and the CLI rewrites a fresh valid blob itself, so no restore is
+  needed on success (restore the original only if the test aborts early).
+  Clear the stored `resets_at` first or the early-exit gate skips the check.
 - **Live (spends a tiny Haiku turn, opens/uses a window):** `--run`. Only do this
   intentionally. `--run` fires even if a window is already open, so it validates
   the mechanism (prompt → reply → teardown) without waiting for a reset.

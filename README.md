@@ -24,22 +24,28 @@ waiting for a new window to start after you hit a limit.
 1. **Check** — read Claude Code's OAuth usage endpoint directly for the `session`
    (5h) limit's `resets_at`. No API key needed — Claude Code's existing login is
    used (token resolution + fetch are built in; no external dependency).
-2. **Stop if open** — a window is already running → do nothing.
-3. **Jitter** — window closed → wait `0..jitter-max` seconds (default 180), then
+2. **Self-heal (only if the stored token has expired)** — >8h without any Claude
+   activity leaves the stored access token expired, so the check can't
+   authenticate. The tool then launches a bare, **prompt-less** `claude` session
+   in the throwaway tmux — nothing is sent, no window opens, nothing is spent —
+   which makes the CLI refresh its own token within seconds; tear down, re-check
+   with the fresh token. (See *Authentication* for the full story.)
+3. **Stop if open** — a window is already running → do nothing.
+4. **Jitter** — window closed → wait `0..jitter-max` seconds (default 180), then
    re-check (normal activity during the jitter may have already opened one).
-4. **Open a tmux session** — unique name on an isolated socket
+5. **Open a tmux session** — unique name on an isolated socket
    (`-L claude-auto-window`), never touching your real tmux server.
-5. **Run** `claude "Reply with exactly: OK."` **directly** as the pane's process
+6. **Run** `claude "Reply with exactly: OK."` **directly** as the pane's process
    (not typed into a shell, so there's no command-echo noise), as light as
    possible (see *Minimal footprint*).
-6. **Wait for the reply** — poll `capture-pane`, filter out the prompt-echo
+7. **Wait for the reply** — poll `capture-pane`, filter out the prompt-echo
    lines, and match Claude's own reply (`OK.`). If the first-run
    **workspace-trust dialog** appears, it's accepted automatically (Enter → the
    default "Yes, I trust this folder") — safe because the starter dir is a
    dedicated dir you own.
-7. **Quit** — send `/exit`; if still running, `Ctrl-C Ctrl-C`; then
+8. **Quit** — send `/exit`; if still running, `Ctrl-C Ctrl-C`; then
    `kill-session` by name unconditionally (in an `always` block).
-8. **Clean up** — delete the starter's own transcript, verify the window flipped
+9. **Clean up** — delete the starter's own transcript, verify the window flipped
    active.
 
 A per-profile lock prevents two starters racing for the same account, and a
