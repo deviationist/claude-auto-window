@@ -161,6 +161,33 @@ profiles — see *Loop protection* and *The daemon doesn't poll continuously*.
 per-profile state (including the balance verdict) and is the handy health-check
 for a running daemon.
 
+### Known limitation — serial account swappers
+
+A profile is a **config dir**, and the tool assumes one dir ⇒ one account. That
+assumption breaks against tools that multiplex several accounts through a
+*single* dir, swapping the live credential in and out — e.g.
+[claude-profile](https://github.com/deviationist/claude-profile)'s serial model,
+where `~/.claude` holds one live account and the others sit **parked** in a
+credential store.
+
+In that setup the keeper only ever sees whichever account is currently live.
+**Parked accounts' windows are never opened** — they lapse and stay closed,
+silently, because nothing enumerates them. Listing the same dir twice doesn't
+help: profiles dedup by resolved dir, so there's no way to express "two accounts
+live here".
+
+The window itself isn't the obstacle. A 5-hour window is a property of the
+**account** (server-side), not of the config dir, and a parked credential is a
+perfectly usable OAuth token — so a parked account's window can be opened
+without swapping it live. The fix is to launch against a *shadow* config dir
+built from the parked credential, with one caveat that dominates the design:
+**refresh tokens rotate on use**, so a real `claude` launch against a shadow dir
+invalidates the copy held by the swapping tool unless the rotated blob is
+written back. Whatever bridges the two must be the single writer of that
+credential.
+
+Not solved yet — tracked in claude-profile's `TODO.md`.
+
 ## Where it runs
 
 The starter never runs in your current/work directory. It `cd`s into a dedicated
