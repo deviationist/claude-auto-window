@@ -258,6 +258,17 @@ exit is **0** once all profiles are disabled.
   daemon **retries it each wake** rather than disabling it (a real breaker trip is
   a distinct sentinel). It **self-heals** the moment you `claude`-log-in that
   profile. Only rc 70 (genuinely no 5h window) disables for the daemon's lifetime.
+- **One profile == one config dir == one account — this breaks serial account
+  swappers.** Tools that multiplex N accounts through a *single* dir (parking the
+  inactive credentials in their own store) are invisible to profile resolution:
+  only the live account is ever checked, and parked accounts' 5h windows silently
+  lapse. `_caw_resolve_profiles` dedups by resolved dir, so listing a dir twice
+  can't express "two accounts here". Any fix must respect that **refresh tokens
+  rotate on use** — launching against a shadow dir built from a parked credential
+  rotates that pair and stales the swapper's stored copy, so exactly one component
+  may own the write-back. Don't solve this by teaching the script to park/unpark
+  credentials itself; that duplicates the swapper's store and creates two writers.
+  See README → *Known limitation — serial account swappers*.
 - **The balance gate keys on the starter's OWN model.** `--model` changes which
   model-scoped weekly bucket `_caw_plan_exhausted` consults alongside `weekly_all`
   — a different-model scoped cap (e.g. Fable) does not govern a haiku starter.
