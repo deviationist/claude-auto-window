@@ -16,6 +16,12 @@
 #   # a second account/profile, side by side:
 #   systemctl --user enable --now claude-auto-window@personal.service
 #
+# One-instance multi-profile (alternative to N instances): since v1.1.0 a single
+# daemon can hold several logins open. Put CLAUDE_AUTO_WINDOW_PROFILES="personal
+# work" in the EnvironmentFile and drop the "--profile %i" from ExecStart (it
+# would otherwise pin just that one). N side-by-side instances remain the tidier
+# systemd idiom; the single-unit form is the macOS-parity option.
+#
 # Headless server (no persistent login session): enable lingering so the --user
 # manager runs at boot without anyone logged in:
 #   sudo loginctl enable-linger "$USER"

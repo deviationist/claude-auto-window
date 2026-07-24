@@ -19,6 +19,26 @@
   <key>StartInterval</key><integer>300</integer>.
 
   Change --profile default to target another Claude profile (see README).
+
+  Multi-account (the macOS win — ONE plist holds N logins open): --profile is
+  repeatable, so add more pairs to ProgramArguments. e.g. to keep both the
+  default and a personal login open, the array becomes:
+
+    <string>--daemon</string>
+    <string>--profile</string><string>default</string>
+    <string>--profile</string><string>personal</string>
+    <string>--log</string>
+    <string>__HOME__/.local/state/claude-auto-window/daemon.log</string>
+
+  (launchd has no instance templates, so before this the only option was a
+  hand-duplicated plist per account; now one daemon services them all.)
+-->
+<!--
+  ADVANCED multi-profile form — uncomment/adapt (and remove the single-profile
+  --profile default below) to hold two logins open from this one agent:
+
+  <string>--profile</string><string>default</string>
+  <string>--profile</string><string>personal</string>
 -->
 <plist version="1.0">
 <dict>
