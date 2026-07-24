@@ -23,11 +23,24 @@
 #   --daemon       Loop --once at a fixed interval (systemd/launchd target).
 #   --status       Print the current five-hour session state and exit.
 #
-# Profile
+# Profile (multi-account — one daemon/run services N profiles)
 #   Default: let Claude Code resolve its own profile (~/.claude) — we never set
-#   CLAUDE_CONFIG_DIR for the launch. Multi-profile support:
+#   CLAUDE_CONFIG_DIR for the launch. Both flags below are REPEATABLE and
+#   accumulate (in order), so a single --daemon/--once/--status/--reset can hold
+#   N logins open, each checked independently against its own stored OAuth login
+#   with per-profile failure isolation:
 #     --config-dir PATH   explicit Claude profile dir (sets CLAUDE_CONFIG_DIR)
 #     --profile NAME      default | personal | work | <abs path>
+#   Or set CLAUDE_AUTO_WINDOW_PROFILES="personal work" (comma/space list) once.
+#
+# Balance gate
+#   We only anchor a window when the STARTER's own model is still plan-covered
+#   (i.e. would NOT overflow to paid usage credits). The starter is a tiny
+#   request on the cheapest model, so the governing plan bucket is the overall
+#   weekly cap `weekly_all` (plus any model-scoped weekly cap matching the
+#   starter model). If that's exhausted, the window is worthless anyway (no plan
+#   allowance to spend inside it) and firing would burn credits — so we stand
+#   down. Threshold: CLAUDE_AUTO_WINDOW_WEEKLY_MAX_PERCENT (default 100).
 #
 # Observability
 #   Logs go to stdout/stderr always (journal-friendly). Opt in to a file with
@@ -39,7 +52,7 @@
 #   source ./claude-auto-window && claude-auto-window-once
 # ============================================================================
 
-typeset -g CLAUDE_AUTO_WINDOW_VERSION="1.0.0"
+typeset -g CLAUDE_AUTO_WINDOW_VERSION="1.1.0"
 
 # ----------------------------------------------------------------------------
 # Logging — stdout/stderr always; append to $CLAUDE_AUTO_WINDOW_LOG if opted in.
@@ -241,6 +254,38 @@ _caw_status_line() {
   pct="$(jq -r '.percent // 0'       <<< "$session")"
   reset="$(jq -r '.resets_at // "?"' <<< "$session")"
   print -r -- "profile=$dir five_hour_open=$open percent=$pct resets_at=$reset"
+
+  # Balance-gate view — what the daemon will ACTUALLY do next, and why. The
+  # starter's own model decides which weekly bucket governs it (see
+  # _caw_plan_exhausted); this is the single most useful line when eyeballing
+  # whether the daemon is keeping a window open or standing down to spare credits.
+  local model="${CLAUDE_AUTO_WINDOW_MODEL-haiku}" wpct verdict
+  wpct="$(jq -r 'first(.limits[]? | select(.kind=="weekly_all")) | .percent // "?"' <<< "$json" 2>/dev/null)"
+  if _caw_plan_exhausted "$json" "$model"; then
+    verdict="WOULD SKIP — starter model '${model:-<account default>}' is off-plan (credit-billed / refused)"
+  else
+    verdict="would fire — starter model '${model:-<account default>}' still on plan"
+  fi
+  print -r -- "  weekly_all=${wpct}%  →  $verdict"
+
+  # Credits (extra_usage), if the account has them — these are only spent once a
+  # plan bucket is exhausted, so a non-zero balance here is NOT proof of spend.
+  local credit_line
+  credit_line="$(jq -r '
+      (.extra_usage // {}) as $e |
+      if ($e.is_enabled // false) then
+        (pow(10; ($e.decimal_places // 2))) as $d |
+        ((($e.used_credits  // 0)/$d*100)|round/100) as $used |
+        ((($e.monthly_limit // 0)/$d*100)|round/100) as $lim  |
+        "  credits=\($used)/\($lim) \($e.currency // "") used (\(($e.utilization // 0)|floor)%) — spent only after plan is exhausted"
+      else empty end' <<< "$json" 2>/dev/null)"
+  [[ -n "$credit_line" ]] && print -r -- "$credit_line"
+
+  # Daemon's own source of truth: the stored resets_at it sleeps against (can lag
+  # the live endpoint by a few minutes right after a fresh open).
+  local ssr; ssr="$(_caw_state_get "$dir" resets_at 2>/dev/null)"
+  [[ -n "$ssr" && "$ssr" != "$reset" ]] && print -r -- "  daemon-stored resets_at=$ssr"
+
   if _caw_breaker_tripped "$dir"; then
     print -r -- "  ⚠ DISABLED (sentinel present): $(_caw_state_file "$dir" tripped)"
     print -r -- "    reason: $(_caw_breaker_reason "$dir")"
@@ -248,9 +293,10 @@ _caw_status_line() {
   fi
 }
 
-# Public: clear a tripped circuit breaker (and the failure counter) so the
-# daemon/cron will resume opening windows.
-claude-auto-window-reset() {
+# Clear a tripped circuit breaker (and the failure counter) for the CURRENTLY
+# pinned profile, so the daemon/cron will resume opening its window. Single-
+# profile body; the public claude-auto-window-reset iterates it over all specs.
+_caw_reset_one() {
   emulate -L zsh
   local dir; dir="$(_caw_check_dir)"
   if _caw_breaker_tripped "$dir"; then
@@ -262,13 +308,43 @@ claude-auto-window-reset() {
   fi
 }
 
-# Is a weekly allowance exhausted? (Don't burn a starter if capped.)
-_caw_weekly_exhausted() {
+# Would firing a starter now draw from purchased usage credits instead of the
+# plan (or fail to send at all)? This is the "balance gate": the whole point of
+# holding a window open is to soak up PLAN allowance you'd otherwise waste — if
+# the plan is exhausted, the starter either can't send (rate-limited → no reply)
+# or spends real credits, and the window is worthless anyway (no plan allowance
+# left to use inside it). Either way: don't open it.
+#
+# Credits only cover a request once the PLAN limit governing THAT request is
+# exhausted (the endpoint's own words: "Usage credits cover you when you hit your
+# plan limits"). The starter is one tiny request on $model, fired only when the
+# 5-hour window is closed (so the session cap is fresh) — hence the governing
+# plan limit is the overall weekly cap `weekly_all`, PLUS any model-scoped weekly
+# cap (`weekly_scoped`) whose scope matches $model. A scoped cap for a DIFFERENT
+# model (e.g. Fable maxed while the starter is haiku) is that model's bucket and
+# must NOT block us — anchoring on haiku there is still plan-covered and free.
+#
+# "Exhausted" = percent >= CLAUDE_AUTO_WINDOW_WEEKLY_MAX_PERCENT (default 100; set
+# it lower, e.g. 97, for a safety margin against edge-of-limit credit bleed) OR
+# severity "exceeded". Returns 0 = exhausted (skip the starter), non-zero = still
+# on plan (fire away).
+_caw_plan_exhausted() {
   emulate -L zsh
-  local json="$1"
-  jq -e 'any(.limits[]?;
-      ((.kind=="weekly_all" or .kind=="weekly_scoped")
-       and (((.percent // 0) >= 100) or ((.severity // "normal") == "exceeded"))))' \
+  local json="$1" model="${2:-}"
+  local max="${CLAUDE_AUTO_WINDOW_WEEKLY_MAX_PERCENT:-100}"
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_WEEKLY_MAX_PERCENT "$max" || max=100
+  # Model-scope match is fuzzy on purpose: scoped caps carry a display_name
+  # ("Fable", "Sonnet", …) while $model is usually an alias ("haiku", "sonnet").
+  # A case-insensitive substring match either way pairs "sonnet" with "Sonnet"
+  # without pairing "haiku" with "Fable". Empty $model (account-default starter)
+  # ⇒ we can't scope-match, so only weekly_all governs — the safe choice.
+  jq -e --argjson max "$max" --arg model "${model:l}" '
+      def exhausted: ((.percent // 0) >= $max) or ((.severity // "normal") == "exceeded");
+      any(.limits[]?;
+        (.kind == "weekly_all" and exhausted)
+        or (.kind == "weekly_scoped" and exhausted and ($model != "")
+            and (((.scope.model.display_name // "") | ascii_downcase) as $dn
+                 | $dn != "" and (($model | contains($dn)) or ($dn | contains($model))))))' \
     <<< "$json" >/dev/null 2>&1
 }
 
@@ -760,8 +836,9 @@ _caw_verify_started() {
 # Public entry points
 # ============================================================================
 
-# Immediately fire one starter — no checks, no jitter.
-claude-auto-window-run() {
+# Immediately fire one starter for the pinned profile — no checks, no jitter.
+# Single-profile body; the public claude-auto-window-run iterates it.
+_caw_run_one() {
   emulate -L zsh
   local dir lock rc verify="${CLAUDE_AUTO_WINDOW_VERIFY:-1}"
   dir="$(_caw_check_dir)"
@@ -789,8 +866,10 @@ claude-auto-window-run() {
   }
 }
 
-# Guarded cycle: check the window; only if none is open, jitter then fire.
-claude-auto-window-once() {
+# Guarded cycle for the pinned profile: check the window; only if none is open,
+# jitter then fire. Single-profile body; the public claude-auto-window-once (and
+# the daemon) iterate it across profiles.
+_caw_once_one() {
   emulate -L zsh
   local dir lock rc
   local jitter_max="${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}"
@@ -865,10 +944,13 @@ claude-auto-window-once() {
       return 0
     fi
 
-    # Window is closed. Guard against a spent weekly allowance before spending.
+    # Window is closed. Balance gate: don't fire if the starter's model would be
+    # off-plan (credit-billed / refused) — see _caw_plan_exhausted. The starter's
+    # model is what decides which weekly plan bucket governs it.
+    local model="${CLAUDE_AUTO_WINDOW_MODEL-haiku}"
     local json; json="$(_caw_usage_json "$dir")"
-    if _caw_weekly_exhausted "$json"; then
-      _caw_log WARN "Weekly allowance exhausted; skipping starter"
+    if _caw_plan_exhausted "$json" "$model"; then
+      _caw_log WARN "Weekly plan allowance exhausted for the starter model '${model:-<account default>}'; skipping (won't burn credits to anchor a window you'd have no plan allowance to use)"
       return 0
     fi
 
@@ -887,8 +969,8 @@ claude-auto-window-once() {
       return 0
     }
     json="$(_caw_usage_json "$dir")"
-    _caw_weekly_exhausted "$json" && {
-      _caw_log WARN "Weekly allowance became exhausted during jitter; skipping starter"
+    _caw_plan_exhausted "$json" "$model" && {
+      _caw_log WARN "Weekly plan allowance became exhausted during jitter; skipping starter"
       return 0
     }
 
@@ -919,15 +1001,22 @@ Re-enable with:  claude-auto-window --reset
   }
 }
 
-# Daemon: run the guarded cycle, then sleep until the window expires instead of
-# polling on a fixed cadence. When a window is open we know exactly when it ends
-# (the stored resets_at), so we sleep until just after that — no polling in
-# between. We only re-check at the fine interval to confirm a just-opened window
-# (the endpoint lags a few minutes). A safety cap (MAX_SLEEP) bounds any single
-# sleep.
+# Daemon: service every configured profile each wake, then sleep until the
+# EARLIEST profile's window expires instead of polling on a fixed cadence. When a
+# window is open we know exactly when it ends (that profile's stored resets_at),
+# so we sleep until just after the soonest one — no polling in between. We only
+# re-check at the fine interval to confirm a just-opened window (the endpoint lags
+# a few minutes). A safety cap (MAX_SLEEP) bounds any single sleep.
+#
+# Multi-profile: profiles are serviced serially (a few minutes of serial jitter
+# is irrelevant against 5-hour windows, and no background subshells keeps the
+# lock/trap/log story simple). Each profile is failure-isolated and tracked
+# independently in a disable map — "no-window" (rc 70; account type can't change,
+# so a lifetime disable) or "breaker" (rc 3; disabled until its sentinel is
+# cleared by --reset, re-checked cheaply each wake). The daemon exits 0 only when
+# EVERY profile is disabled.
 claude-auto-window-daemon() {
   emulate -L zsh
-  local dir; dir="$(_caw_check_dir)"
   local interval="${CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS:-60}"
   _caw_validate_uint CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS "$interval" || return $?
   (( interval >= 1 )) || { _caw_log ERROR "interval must be >= 1"; return 2; }
@@ -939,69 +1028,204 @@ claude-auto-window-daemon() {
 
   # Fail fast on persistent config errors so systemd's restart policy sees them.
   _caw_resolve_claude_bin >/dev/null || return $?
+  _caw_resolve_profiles || { _caw_log ERROR "Invalid profile configuration; daemon exiting"; return 2; }
+
+  local -a specs; specs=( "${_caw_profiles[@]}" )
+  local spec d
+  local -a dirs; for spec in "${specs[@]}"; do dirs+=( "$(_caw_profile_dir "$spec")" ); done
 
   local stop=0
   trap 'stop=1' INT TERM HUP
 
-  _caw_log INFO "Daemon up: sleeps until window expiry (confirm poll ${interval}s, max sleep ${maxsleep}s), jitter ${CLAUDE_AUTO_WINDOW_JITTER_MIN_SECONDS:-0}-${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}s"
-  local rc sleep_for now_s
+  _caw_log INFO "Daemon up: ${#specs} profile(s) [${(j:, :)dirs}]; sleeps until earliest window expiry (confirm poll ${interval}s, max sleep ${maxsleep}s), jitter ${CLAUDE_AUTO_WINDOW_JITTER_MIN_SECONDS:-0}-${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}s"
+  typeset -A disabled          # check dir → "no-window" | "breaker"
+  local rc sleep_for now_s sr sre cand summary
   while (( ! stop )); do
-    claude-auto-window-once; rc=$?
-    if (( rc == 2 )); then
-      _caw_log ERROR "Fatal configuration error; daemon exiting"
-      return "$rc"
-    elif (( rc == 70 )); then
-      _caw_log WARN "This account has no 5-hour window to keep open — daemon exiting (nothing to do)."
-      return 0                        # clean exit → systemd leaves it stopped, no restart loop
-    elif (( rc == 3 )); then
-      _caw_log ERROR "Circuit breaker tripped — daemon exiting to avoid a loop. Reset with: claude-auto-window --reset"
-      return 0                        # clean exit; the persistent sentinel keeps it stopped across restarts
-    elif (( rc != 0 && rc != 75 )); then
-      _caw_log WARN "Cycle failed (status $rc); retrying in ${interval}s"
+    # --- service every profile in turn (serial, per-profile isolation) ---
+    for spec in "${specs[@]}"; do
+      (( stop )) && break
+      d="$(_caw_profile_dir "$spec")"
+      # A breaker-disabled profile auto-re-enables once its sentinel is cleared
+      # (--reset) — a cheap file test each wake, no daemon restart needed.
+      if [[ "${disabled[$d]}" == breaker ]]; then
+        if _caw_breaker_tripped "$d"; then
+          continue                                   # still tripped → skip silently (already notified)
+        fi
+        unset "disabled[$d]"
+        _caw_log INFO "Profile $d: breaker sentinel cleared — re-enabling"
+      fi
+      [[ "${disabled[$d]}" == no-window ]] && continue   # account type won't change → stay disabled
+
+      _caw_pin_profile "$spec"
+      _caw_once_one; rc=$?
+      case "$rc" in
+        2)  _caw_log ERROR "Fatal configuration error ($d); daemon exiting"; return 2 ;;
+        70) disabled[$d]="no-window"
+            _caw_log WARN "Profile $d has no 5-hour window (API/usage-billed seat?) — disabling it for the daemon's lifetime" ;;
+        3)  disabled[$d]="breaker"
+            _caw_log ERROR "Profile $d circuit breaker tripped — disabling until --reset clears its sentinel" ;;
+        75) ;;                                        # another instance holds this profile's lock; fine
+        0)  ;;
+        *)  _caw_log WARN "Profile $d cycle failed (status $rc); will retry next wake" ;;
+      esac
+    done
+
+    # --- all profiles disabled ⇒ nothing left to keep open ⇒ clean exit 0 ---
+    # (preserves the single-profile invariant: systemd/launchd leave it stopped)
+    local enabled=0
+    for spec in "${specs[@]}"; do
+      [[ -n "${disabled[$(_caw_profile_dir "$spec")]}" ]] || { enabled=1; break; }
+    done
+    if (( ! enabled )); then
+      _caw_log WARN "All ${#specs} profile(s) disabled — daemon exiting (nothing to keep open)."
+      return 0
     fi
 
-    # Read the stored resets_at (single source of truth). If it's in the future,
-    # sleep until just AFTER expiry (+ buffer): the next check then sees it closed
-    # and fires. Otherwise poll at the fine interval to confirm a freshly opened
-    # window (the endpoint lags a few minutes before it reflects the new resets_at).
-    sleep_for=$interval
-    local sr sre
-    sr="$(_caw_state_get "$dir" resets_at)"
-    if [[ -n "$sr" ]]; then
-      sre="$(_caw_iso_to_epoch "$sr")"
-      if [[ "$sre" == <-> ]]; then
-        now_s=$(date +%s)
-        if (( sre > now_s )); then                          # future → sleep to expiry+buffer
-          sleep_for=$(( sre + buffer - now_s ))
-          (( sleep_for > maxsleep )) && sleep_for=$maxsleep # safety cap (clock drift / suspend)
-          _caw_log INFO "Window open until $sr; sleeping ${sleep_for}s (wake ${buffer}s after expiry)"
-        fi
+    # --- sleep = min over ENABLED profiles of (resets_at+buffer-now | interval) ---
+    # A not-due profile costs nothing on wake: _caw_once_one's stored-resets_at
+    # early-exit returns without any network fetch. So we wake at the SOONEST
+    # expiry; every other profile just no-ops until its own turn comes due.
+    now_s=$(date +%s)
+    sleep_for=$maxsleep
+    summary=""
+    for spec in "${specs[@]}"; do
+      d="$(_caw_profile_dir "$spec")"
+      [[ -n "${disabled[$d]}" ]] && { summary+=" ${d:t}=disabled"; continue; }
+      cand=$interval
+      if sr="$(_caw_state_get "$d" resets_at)" && [[ -n "$sr" ]] \
+         && sre="$(_caw_iso_to_epoch "$sr")" && [[ "$sre" == <-> ]] && (( sre > now_s )); then
+        cand=$(( sre + buffer - now_s ))                  # window open → sleep to expiry+buffer
+        summary+=" ${d:t}=due@${sr:11:8}"
+      else
+        summary+=" ${d:t}=confirm"                        # closed / just-opened → poll at interval
       fi
-    fi
+      (( cand < 1 )) && cand=1
+      (( cand < sleep_for )) && sleep_for=$cand
+    done
+    (( sleep_for > maxsleep )) && sleep_for=$maxsleep     # safety cap (clock drift / suspend)
+    (( sleep_for < 1 )) && sleep_for=1
+    _caw_log INFO "Sleeping ${sleep_for}s (min over profiles;${summary} )"
     (( stop )) || sleep "$sleep_for" || true
   done
   _caw_log INFO "Daemon stopped"
   return 0
 }
 
-claude-auto-window-status() {
+# Single-profile status line; the public claude-auto-window-status iterates it.
+_caw_status_one() {
   emulate -L zsh
   _caw_status_line "$(_caw_check_dir)"
 }
 
 # ----------------------------------------------------------------------------
-# Profile-name → config dir mapping for --profile.
+# Public iterator wrappers — resolve the profile list, then run the matching
+# single-profile body for each spec (pinning it first). They CONTINUE through
+# every profile on failure (per-profile isolation) and return the FIRST non-zero
+# rc seen (0 if all succeeded). This keeps the sourced API names working and
+# gives cron/one-shot users multi-profile through a single invocation. The
+# daemon does NOT use these — it has its own per-profile disable/sleep loop.
 # ----------------------------------------------------------------------------
-_caw_apply_profile() {
+_caw_iterate() {   # $1 = the _one body to run for each pinned profile
+  emulate -L zsh
+  local body="$1" spec rc first=0
+  _caw_resolve_profiles || return 2
+  for spec in "${_caw_profiles[@]}"; do
+    _caw_pin_profile "$spec"
+    "$body"; rc=$?
+    (( rc != 0 && first == 0 )) && first=$rc
+  done
+  return $first
+}
+
+claude-auto-window-run()    { emulate -L zsh; _caw_iterate _caw_run_one; }
+claude-auto-window-once()   { emulate -L zsh; _caw_iterate _caw_once_one; }
+claude-auto-window-status() { emulate -L zsh; _caw_iterate _caw_status_one; }
+claude-auto-window-reset()  { emulate -L zsh; _caw_iterate _caw_reset_one; }
+
+# ----------------------------------------------------------------------------
+# Profile specs — the multi-profile substrate. A "spec" is a single string that
+# is EITHER the literal `default` (unpinned — Claude Code resolves ~/.claude on
+# its own; we never set CLAUDE_CONFIG_DIR) OR an absolute config dir (pinned).
+# The daemon and the iterator wrappers hold a list of these in the global array
+# `_caw_profiles` and service each one in turn by pinning it into the ambient
+# env the (untouched) single-profile bodies already read.
+# ----------------------------------------------------------------------------
+# NAME → spec. Mirrors the old _caw_apply_profile mapping, but PRINTS the spec
+# instead of mutating env. Unknown name → error rc 2 (same message as before).
+_caw_profile_spec() {
   emulate -L zsh
   local name="$1"
   case "$name" in
-    ""|default)  return 0 ;;                                            # let Claude resolve ~/.claude
-    personal)    typeset -gx CLAUDE_AUTO_WINDOW_CONFIG_DIR="$HOME/.claude-personal" ;;
-    work)        typeset -gx CLAUDE_AUTO_WINDOW_CONFIG_DIR="$HOME/.claude" ;;
-    /*)          typeset -gx CLAUDE_AUTO_WINDOW_CONFIG_DIR="$name" ;;   # absolute path
+    ""|default)  print -r -- default ;;                     # let Claude resolve ~/.claude
+    personal)    print -r -- "$HOME/.claude-personal" ;;
+    work)        print -r -- "$HOME/.claude" ;;
+    /*)          print -r -- "${name%/}" ;;                 # absolute path
     *)           _caw_log ERROR "unknown --profile '$name' (use default|personal|work|<abs path>)"; return 2 ;;
   esac
+}
+
+# spec → concrete check dir (the usage endpoint always needs a real path). The
+# `default` spec maps to ~/.claude — Claude Code's own default profile, which is
+# also what _caw_check_dir falls back to. Used for state-file keying and dedup.
+_caw_profile_dir() {
+  emulate -L zsh
+  local spec="$1"
+  [[ "$spec" == default ]] && { print -r -- "$HOME/.claude"; return 0; }
+  print -r -- "${spec%/}"
+}
+
+# Pin a spec into the ambient env so the single-profile bodies act on it. The
+# `default` spec UNsets CLAUDE_AUTO_WINDOW_CONFIG_DIR so _caw_launch_profile_pinned
+# stays false and the launch remains a transparent passthrough (never sets
+# CLAUDE_CONFIG_DIR); any other spec pins it.
+_caw_pin_profile() {
+  emulate -L zsh
+  local spec="$1"
+  if [[ "$spec" == default ]]; then
+    unset CLAUDE_AUTO_WINDOW_CONFIG_DIR
+  else
+    typeset -gx CLAUDE_AUTO_WINDOW_CONFIG_DIR="$spec"
+  fi
+}
+
+# Populate the global `_caw_profiles` array once, by precedence:
+#   1. already non-empty (CLI --profile/--config-dir appended specs) → keep
+#   2. CLAUDE_AUTO_WINDOW_PROFILES (comma- and/or space-separated names/paths)
+#   3. CLAUDE_AUTO_WINDOW_CONFIG_DIR set (legacy single-profile env) → one spec
+#   4. fallback → a single `default`
+# Then dedup by concrete check dir (first occurrence wins; WARN on the repeat —
+# e.g. `--profile work --profile default` both resolve to ~/.claude). Returns
+# non-zero if any name in CLAUDE_AUTO_WINDOW_PROFILES was unresolvable.
+_caw_resolve_profiles() {
+  emulate -L zsh
+  typeset -ga _caw_profiles
+  local -a out
+  local sp d name rc=0
+  if (( ${#_caw_profiles} )); then
+    out=( "${_caw_profiles[@]}" )
+  elif [[ -n "${CLAUDE_AUTO_WINDOW_PROFILES:-}" ]]; then
+    local -a raw; raw=( ${(s: :)${CLAUDE_AUTO_WINDOW_PROFILES//,/ }} )
+    for name in "${raw[@]}"; do
+      sp="$(_caw_profile_spec "$name")" || { rc=2; continue; }
+      out+=( "$sp" )
+    done
+  elif [[ -n "${CLAUDE_AUTO_WINDOW_CONFIG_DIR:-}" ]]; then
+    out=( "${CLAUDE_AUTO_WINDOW_CONFIG_DIR%/}" )
+  else
+    out=( default )
+  fi
+  local -A seen
+  _caw_profiles=()
+  for sp in "${out[@]}"; do
+    d="$(_caw_profile_dir "$sp")"
+    if [[ -n "${seen[$d]:-}" ]]; then
+      _caw_log WARN "Duplicate profile resolving to $d (spec '$sp') — ignoring the repeat"
+      continue
+    fi
+    seen[$d]=1
+    _caw_profiles+=( "$sp" )
+  done
+  return $rc
 }
 
 _caw_usage_text() {
@@ -1015,10 +1239,16 @@ Usage:
   claude-auto-window --status            # print current five-hour session state
   claude-auto-window --reset             # clear a tripped circuit breaker
 
-Profile:
+Profile (repeatable — one daemon/run holds N accounts open):
   --config-dir PATH        Explicit Claude profile dir (pins CLAUDE_CONFIG_DIR)
   --profile NAME           default | personal | work | <abs path>
                            (default = let Claude Code resolve ~/.claude)
+                           Repeat either flag to service several profiles, e.g.
+                           --profile default --profile personal. Or set
+                           CLAUDE_AUTO_WINDOW_PROFILES="personal work" once.
+                           Each profile is checked/opened independently with
+                           per-profile failure isolation; --status prints one
+                           block per profile (with the balance-gate verdict).
 
 Tuning (all also settable via CLAUDE_AUTO_WINDOW_* env, or a config file at
 $XDG_CONFIG_HOME/claude-auto-window/config):
@@ -1055,6 +1285,10 @@ $XDG_CONFIG_HOME/claude-auto-window/config):
                            5-hour window (bypasses the only --run safety check).
   --max-failures N         Consecutive opens that never register a window before
                            the circuit breaker trips + stops.        Default: 3
+  --weekly-max-percent N   Balance gate: skip the starter once the weekly plan
+                           bucket governing the starter model reaches N% (so we
+                           never burn usage credits to anchor a window). Lower it
+                           (e.g. 97) for a safety margin.             Default: 100
   --notify-cmd CMD         Shell command run when the breaker trips (message on
                            stdin and in $CLAUDE_AUTO_WINDOW_MESSAGE). e.g. a
                            notify-send / mail / ntfy / osascript one-liner.
@@ -1078,7 +1312,10 @@ _caw_main() {
   # not already set in the environment; CLI flags below override both.
   _caw_load_config
 
-  local mode="once" mode_set=0 profile="" config_dir=""
+  # --profile / --config-dir are REPEATABLE: each occurrence appends a spec to
+  # the profile list (in order given), so one invocation can service N profiles.
+  typeset -ga _caw_profiles; _caw_profiles=()
+  local mode="once" mode_set=0 _sp
   while (( $# )); do
     case "$1" in
       --run|--open-now)  [[ $mode_set == 1 && $mode != run ]] && { print -u2 "pick one mode"; return 2; }; mode=run; mode_set=1 ;;
@@ -1091,12 +1328,14 @@ _caw_main() {
       --force)           typeset -gx CLAUDE_AUTO_WINDOW_FORCE=1 ;;
       --max-failures)    typeset -gx CLAUDE_AUTO_WINDOW_MAX_FAILURES="$2"; shift ;;
       --max-failures=*)  typeset -gx CLAUDE_AUTO_WINDOW_MAX_FAILURES="${1#*=}" ;;
+      --weekly-max-percent)   typeset -gx CLAUDE_AUTO_WINDOW_WEEKLY_MAX_PERCENT="$2"; shift ;;
+      --weekly-max-percent=*) typeset -gx CLAUDE_AUTO_WINDOW_WEEKLY_MAX_PERCENT="${1#*=}" ;;
       --notify-cmd)      typeset -gx CLAUDE_AUTO_WINDOW_NOTIFY_CMD="$2"; shift ;;
       --notify-cmd=*)    typeset -gx CLAUDE_AUTO_WINDOW_NOTIFY_CMD="${1#*=}" ;;
-      --profile)         profile="$2"; shift ;;
-      --profile=*)       profile="${1#*=}" ;;
-      --config-dir)      config_dir="$2"; shift ;;
-      --config-dir=*)    config_dir="${1#*=}" ;;
+      --profile)         _sp="$(_caw_profile_spec "$2")" || return $?; _caw_profiles+=( "$_sp" ); shift ;;
+      --profile=*)       _sp="$(_caw_profile_spec "${1#*=}")" || return $?; _caw_profiles+=( "$_sp" ) ;;
+      --config-dir)      _caw_profiles+=( "${2%/}" ); shift ;;
+      --config-dir=*)    _sp="${1#*=}"; _caw_profiles+=( "${_sp%/}" ) ;;
       --interval)        typeset -gx CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS="$2"; shift ;;
       --interval=*)      typeset -gx CLAUDE_AUTO_WINDOW_INTERVAL_SECONDS="${1#*=}" ;;
       --max-sleep)       typeset -gx CLAUDE_AUTO_WINDOW_MAX_SLEEP_SECONDS="$2"; shift ;;
@@ -1135,12 +1374,8 @@ _caw_main() {
     shift
   done
 
-  # --config-dir wins over --profile; both set the same env the funcs read.
-  if [[ -n "$config_dir" ]]; then
-    typeset -gx CLAUDE_AUTO_WINDOW_CONFIG_DIR="${config_dir%/}"
-  elif [[ -n "$profile" ]]; then
-    _caw_apply_profile "$profile" || return $?
-  fi
+  # Profiles are resolved (env/config fallback + dedup) lazily by the iterator
+  # wrappers and the daemon — CLI-appended specs above take precedence there.
 
   case "$mode" in
     run)    claude-auto-window-run ;;

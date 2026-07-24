@@ -49,7 +49,11 @@ waiting for a new window to start after you hit a limit.
    active.
 
 A per-profile lock prevents two starters racing for the same account, and a
-weekly-allowance guard skips the starter if you're already weekly-capped.
+**balance gate** skips the starter when the plan bucket that would cover it is
+exhausted (so the tool never burns usage credits to anchor a worthless window —
+see *Balance gate*). One daemon (or one `--once`/`--run`/`--status`/`--reset`)
+can service several profiles at once, each checked and opened independently —
+see *Profiles (multi-account)*.
 
 ## Requirements
 
@@ -114,15 +118,48 @@ claude-auto-window --reset      # clear a tripped circuit breaker (see below)
 
 ## Profiles (multi-account)
 
-Default is a transparent passthrough: `CLAUDE_CONFIG_DIR` is never set, so Claude
-Code resolves `~/.claude` exactly as a bare `claude` call would. Each profile is
-checked and opened independently against its **own** stored login.
+**One daemon (or one `--once`/`--run`/`--status`/`--reset`) services N profiles.**
+Each profile is checked and opened independently against its **own** stored OAuth
+login, serially (no concurrency), with **per-profile failure isolation** — one
+account's fault doesn't stall the others. A single-profile invocation behaves
+exactly as before, and existing `<hash>.state` files carry over unchanged.
+
+The `default` profile is a transparent passthrough: `CLAUDE_CONFIG_DIR` is never
+set, so Claude Code resolves `~/.claude` exactly as a bare `claude` call would.
+Any other profile is an absolute config dir, pinned via `CLAUDE_CONFIG_DIR` only
+for that profile's launch.
+
+Three ways to name profiles (a name is `default` | `personal` | `work` | an
+absolute dir):
 
 ```sh
-claude-auto-window --profile personal          # ~/.claude-personal
-claude-auto-window --profile work              # ~/.claude
-claude-auto-window --config-dir /path/to/prof  # any explicit profile dir
+# 1. Repeatable CLI flags — accumulate in order:
+claude-auto-window --profile personal --profile work
+claude-auto-window --profile default --config-dir /path/to/prof   # mix freely
+
+# 2. The PROFILES env/config knob — comma- and/or space-separated:
+CLAUDE_AUTO_WINDOW_PROFILES="personal work" claude-auto-window
+
+# 3. Legacy single pin (still honoured):
+CLAUDE_AUTO_WINDOW_CONFIG_DIR=~/.claude-personal claude-auto-window
 ```
+
+- `personal` → `~/.claude-personal`, `work` → `~/.claude`, `default` → `~/.claude`
+  (unpinned).
+- **Precedence:** CLI `--profile`/`--config-dir` (repeatable) > `CLAUDE_AUTO_WINDOW_PROFILES`
+  > legacy `CLAUDE_AUTO_WINDOW_CONFIG_DIR` (single) > fallback `default`. (Note the
+  change: `--config-dir` no longer silently wins over `--profile` — they now
+  accumulate together.)
+- **Dedup by resolved dir, first wins.** `--profile work --profile default` both
+  resolve to `~/.claude`, so the repeat is dropped with a WARN.
+
+When a daemon services several profiles, it disables them individually (a maxed
+account or a tripped breaker stands that one profile down without touching the
+rest) and sleeps the *minimum* time-to-next-window across all still-enabled
+profiles — see *Loop protection* and *The daemon doesn't poll continuously*.
+`claude-auto-window --status --profile default --profile personal` prints the
+per-profile state (including the balance verdict) and is the handy health-check
+for a running daemon.
 
 ## Where it runs
 
@@ -155,6 +192,38 @@ The point is to spend as few tokens as possible, and leave no trace:
   pins a known `--session-id` and **deletes that exact `<uuid>.jsonl`** on
   teardown. Keep it with `CLAUDE_AUTO_WINDOW_KEEP_TRANSCRIPT=1`.
 
+## Balance gate (never burn usage credits to anchor a window)
+
+The whole point of holding a window open is to soak up **plan allowance** you'd
+otherwise waste. If the plan bucket that would govern the starter is already
+exhausted, firing is pointless *and* costly: the request either can't send
+(rate-limited) or spends real usage **credits** — and the window is worthless
+anyway, because there's no plan allowance left to use inside it. So the tool
+**stands down** in that case (Anthropic's own wording: *"Usage credits cover you
+when you hit your plan limits"* — i.e. credits are only ever spent once the plan
+limit is hit).
+
+Which bucket governs? The starter is a tiny request on its configured model
+(default `haiku`, the cheapest), fired only when the 5-hour window is **closed**
+(so the session cap is fresh). The governing plan bucket is therefore the
+**overall weekly cap** (`weekly_all`), **plus** any **model-scoped** weekly cap
+whose model matches the **starter's own model**. A scoped cap for a *different*
+model does **not** block — e.g. a maxed **Fable** weekly cap while the starter is
+`haiku` is Fable's bucket, not haiku's, so anchoring on haiku is still
+plan-covered and free. (This replaced an older, too-blunt guard that skipped on
+*any* weekly cap at 100%, which wrongly suppressed a cheap haiku starter whenever
+the separate Fable cap was maxed.)
+
+- **Threshold knob** `--weekly-max-percent N` / `CLAUDE_AUTO_WINDOW_WEEKLY_MAX_PERCENT`
+  (default **100**). "Exhausted" = the governing bucket is at ≥ N% **or** its
+  severity is `exceeded`. Set it lower (e.g. `97`) for a safety margin.
+- **On skip** the daemon / `--once` logs a WARN and returns **0** (a clean no-op,
+  not an error); the daemon re-checks on its normal cadence.
+- **`--status`** prints the verdict per profile:
+  `weekly_all=NN%  →  would fire / WOULD SKIP` (naming the starter model), a
+  `credits=USED/LIMIT …` line when the account has usage credits enabled, and the
+  daemon's stored `resets_at` when it differs from the live one.
+
 ## Loop protection (circuit breaker)
 
 A window opens the instant the starter's request completes — but the usage
@@ -166,9 +235,16 @@ otherwise re-fire a pointless starter forever. To prevent that:
 - The tool counts **consecutive opens that never register a window**. The counter
   resets the moment a window is confirmed open.
 - After `CLAUDE_AUTO_WINDOW_MAX_FAILURES` (default **3**) it **trips**: fires a
-  one-time notification, writes a **persistent** trip file, and stops. The
-  **daemon exits cleanly** (systemd leaves it stopped); a **cron** `--once` run
-  becomes a no-op — both stay stopped across restarts until you reset.
+  one-time notification, writes a **persistent** trip file, and stops. A **cron**
+  `--once` run becomes a no-op — it stays stopped across restarts until you reset.
+- **Per-profile disable (multi-profile daemon).** Each profile is disabled on its
+  own: a tripped breaker (rc 3) stands that profile down **until its sentinel is
+  cleared**, and an account with no 5-hour window (rc 70) is disabled for the
+  daemon's lifetime. The daemon keeps servicing the rest and only **exits cleanly**
+  (systemd/launchd leave it stopped) once **all** profiles are disabled.
+- **Auto-re-enable without a restart.** The daemon re-checks each disabled
+  profile's sentinel cheaply on every wake, so `--reset` revives a breaker-tripped
+  profile on the next cycle — no daemon restart needed.
 - **Notify hook:** set `--notify-cmd` / `CLAUDE_AUTO_WINDOW_NOTIFY_CMD` to any
   shell command; it gets the message on stdin and in `$CLAUDE_AUTO_WINDOW_MESSAGE`
   (wire it to `notify-send`, `mail`, `ntfy`, `osascript`, etc.). Without it, the
@@ -192,6 +268,13 @@ minutes, re-checked every `--interval`). So an idle-open window is ~2 requests p
 5-hour window, not ~60. A safety cap (`--max-sleep`, default 6h) bounds any single
 sleep. The total gap after expiry is `post-expiry + jitter`, so keep `--jitter-max`
 small on a single daemon for tight back-to-back windows.
+
+With **several profiles**, each wake services them all serially and the daemon
+sleeps the **minimum** over still-enabled profiles of each one's time-to-next-window
+(its stored `resets_at + --post-expiry − now`, or the confirm-poll interval),
+capped at `--max-sleep` — so it always wakes for whichever account expires soonest.
+Not-yet-due profiles cost nothing on that wake: the stored-`resets_at` early-exit
+returns with no network fetch.
 
 (Cron can't do this — it's stateless external scheduling, so each `--once` fetches
 on the crontab's cadence.)
@@ -222,6 +305,8 @@ Every flag has a `CLAUDE_AUTO_WINDOW_*` env equivalent (see
 | `--jitter-max` | `…_JITTER_MAX_SECONDS` | 180 | Extra 0..N wait before firing (small on a daemon) |
 | `--model` | `…_MODEL` | `haiku` | Model alias/id, `""` = account default |
 | `--max-failures` | `…_MAX_FAILURES` | 3 | Failed opens before the breaker trips |
+| `--weekly-max-percent` | `…_WEEKLY_MAX_PERCENT` | 100 | Balance gate: stand down at ≥N% of the governing plan bucket |
+| `--profile` / `--config-dir` | `…_PROFILES` / `…_CONFIG_DIR` | `default` | Account(s) to service (repeatable — see *Profiles*) |
 | `--log` | `…_LOG` | — | Opt-in log file |
 
 ## Running it continuously
@@ -248,6 +333,13 @@ sudo loginctl enable-linger "$USER"
 
 journalctl --user -u claude-auto-window@default -f    # logs
 ```
+
+The per-profile template still works one-instance-per-account as above.
+Alternatively, since one daemon now services N profiles, a **single** unit can
+run repeated `--profile` flags (`ExecStart=… --daemon --profile default --profile
+personal`) — one process, N logins. The template is handy when you want each
+account isolated as its own systemd unit (independent restart/logs); the single
+unit is lighter.
 
 ### Linux — cron
 
@@ -290,6 +382,20 @@ sed "s|__HOME__|$HOME|g" claude-auto-window.plist > ~/Library/LaunchAgents/claud
 launchctl load ~/Library/LaunchAgents/claude-auto-window.plist
 # stop:  launchctl unload ~/Library/LaunchAgents/claude-auto-window.plist
 # logs:  ~/.local/state/claude-auto-window/launchd.log
+```
+
+**Multi-account is launchd's win.** launchd has no instance templates, so instead
+of N plists you keep **one** plist and repeat `--profile` pairs in
+`ProgramArguments` — one daemon, N subscriptions held open:
+
+```xml
+<key>ProgramArguments</key>
+<array>
+  <string>__HOME__/.local/bin/claude-auto-window</string>
+  <string>--daemon</string>
+  <string>--profile</string><string>default</string>
+  <string>--profile</string><string>personal</string>
+</array>
 ```
 
 ### macOS — cron

@@ -23,24 +23,49 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
 
 ## Architecture (control flow)
 
-- **CLI** `_caw_main` parses flags → sets `CLAUDE_AUTO_WINDOW_*` env → dispatches
-  to a mode function.
+- **CLI** `_caw_main` parses flags → sets `CLAUDE_AUTO_WINDOW_*` env → resolves
+  the profile list → dispatches to a mode function.
+- **Profile resolution** `_caw_resolve_profiles` populates the `_caw_profiles`
+  array (order-preserving, deduped by resolved check-dir, first wins + WARN on
+  the repeat) from, in precedence order: repeatable CLI `--profile`/`--config-dir`
+  > `CLAUDE_AUTO_WINDOW_PROFILES` (comma/space list) > legacy single
+  `CLAUDE_AUTO_WINDOW_CONFIG_DIR` > fallback `default`. A **spec** is either the
+  literal `default` (unpinned) or an absolute dir. Helpers: `_caw_profile_spec
+  NAME` (name→spec, prints — `personal`→`~/.claude-personal`, `work`/`default`→
+  `~/.claude` spec), `_caw_profile_dir SPEC` (spec→concrete check dir; `default`→
+  `~/.claude`), `_caw_pin_profile SPEC` (`default` ⇒ **unset**
+  `CLAUDE_AUTO_WINDOW_CONFIG_DIR`; else pin it) called once before each profile's
+  single-profile body runs.
+- **Iterated modes are thin wrappers.** `claude-auto-window-{once,run,status,reset}`
+  call `_caw_iterate`, which loops `_caw_profiles`, `_caw_pin_profile`s each spec
+  into the ambient env, and runs the renamed **single-profile body**
+  `_caw_{once,run,status,reset}_one` (byte-for-byte the old single-profile logic).
+  It **continues through all profiles on failure** and returns the **first**
+  non-zero rc. The **daemon does not** use `_caw_iterate` — it has its own
+  per-profile loop (below).
 - **Modes:**
-  - `claude-auto-window-run` — fire immediately, **no checks, no jitter**.
-  - `claude-auto-window-once` *(default)* — **early-exit gate first**: read the
+  - `_caw_run_one` — fire immediately, **no checks, no jitter**.
+  - `_caw_once_one` *(default)* — **early-exit gate first**: read the
     stored `resets_at`; if it's still in the future, return 0 WITHOUT fetching
     (this is what makes a per-minute cron cheap). Otherwise check the window —
     **self-healing an expired access token first** (rc 4 → `_caw_refresh_token`
     → re-check; blind fire only as fallback) — and if closed, **jitter** then
-    open. Guards: already-open, weekly-exhausted, no-5h-window. Not a flag —
-    always on; `--status` is the live-check escape.
-  - `claude-auto-window-daemon` — loop `-once`, then sleep off the **stored
-    `resets_at`** (single source of truth, written by `_caw_session_active`): if
-    future, sleep until just AFTER expiry (`resets_at + POST_EXPIRY`, capped at
-    `MAX_SLEEP`) so the next check sees it closed and fires; else poll every
-    `INTERVAL` to confirm a just-opened window (endpoint lag). No continuous
-    polling. Cron can't sleep — it relies on the `-once` early-exit gate instead.
-  - `claude-auto-window-status` — print the current session state.
+    open. Guards: already-open, **balance gate** (`_caw_plan_exhausted`),
+    no-5h-window. Not a flag — always on; `--status` is the live-check escape.
+  - `claude-auto-window-daemon` — its own per-profile loop (**not** `_caw_iterate`):
+    each wake services **every enabled profile serially** (pin → `_caw_once_one`
+    body), tracking a per-profile disable map — `no-window` (rc 70, lifetime
+    disable) or `breaker` (rc 3, until the sentinel is cleared; **re-checked
+    cheaply each wake** so `--reset` revives a profile with no daemon restart).
+    Sleep = **min over still-enabled profiles** of each one's (stored
+    `resets_at + POST_EXPIRY − now`, or `INTERVAL` to confirm a just-opened
+    window), capped at `MAX_SLEEP`. Not-due profiles cost nothing (stored-
+    `resets_at` early-exit, no fetch). Exits **0** (clean; systemd/launchd leave
+    it stopped) only when **all** profiles are disabled. Cron can't sleep — it
+    relies on the `-once` early-exit gate instead.
+  - `_caw_status_one` — print the current session state **plus the balance-gate
+    verdict** (`weekly_all=NN% → would fire / WOULD SKIP`, starter model, credits
+    line, stored-vs-live `resets_at`) — the daemon health-check.
 - **Both `-run` and `-once` open a window via** `_caw_open_window` → which calls
   `_caw_send_starter` and adds the **cheapest-model-with-fallback** retry.
 - **`_caw_send_starter`** is the heavy lifter: build launch argv → `tmux
@@ -60,6 +85,17 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
   prompt-less claude launch that refreshes the token for free; see Gotchas),
   re-checks, and only falls back to firing blind if the refresh launch fails.
   Only 3 hard-fails.
+- **Balance gate** `_caw_plan_exhausted <usage-json> <model>` decides whether
+  firing would burn usage **credits** instead of plan allowance. The starter is
+  fired only when the 5h window is closed (session cap fresh), so the governing
+  plan bucket is the **overall weekly cap** (`weekly_all`) **plus** any
+  model-scoped weekly cap whose model matches the **starter's own** `<model>`. A
+  scoped cap for a *different* model (e.g. a maxed Fable cap while the starter is
+  haiku) is NOT that bucket → does not block. "Exhausted" = percent ≥
+  `WEEKLY_MAX_PERCENT` (default 100) OR severity `exceeded`. On a hit the checked
+  path logs a WARN and returns **0** (clean no-op, same as the old weekly guard).
+  This replaced the too-blunt `_caw_weekly_exhausted` (skipped on *any* weekly cap
+  at 100%, wrongly suppressing a cheap haiku starter when only Fable was maxed).
 
 All private helpers are prefixed **`_caw_`** (claude-auto-window). Public
 functions are the `claude-auto-window*` names.
@@ -81,9 +117,25 @@ functions are the `claude-auto-window*` names.
   unusable here (we rely on the subscription login).
 - **Default model is the `haiku` alias**, not a pinned id — aliases survive model
   rotation. Keep the fallback-to-account-default retry on no-reply.
-- **Profile passthrough:** when no profile is selected, `CLAUDE_CONFIG_DIR` is
-  **never set** — Claude Code resolves `~/.claude` on its own. Only pin it when
-  `--profile`/`--config-dir` is given.
+- **Profile passthrough:** the `default` spec means `CLAUDE_CONFIG_DIR` is
+  **never set** — Claude Code resolves `~/.claude` on its own. Only an absolute-dir
+  spec pins it (`_caw_pin_profile`). Do not set `CLAUDE_CONFIG_DIR` for `default`.
+- **Single-profile behaves identically to before.** The `_caw_*_one` bodies are
+  the byte-for-byte old single-profile logic; a one-profile invocation (and its
+  `<hash>.state` file) is unchanged — no state-format migration. `--config-dir`
+  and `--profile` now **accumulate** (both repeatable) rather than `--config-dir`
+  silently winning; keep the resolution order in `_caw_resolve_profiles` and the
+  dedup-by-resolved-dir (first wins).
+- **Per-profile isolation.** Iterated modes continue through all profiles on
+  failure (return the FIRST non-zero rc); the daemon disables profiles
+  individually (`no-window` lifetime / `breaker` until sentinel cleared) and only
+  **exits cleanly (0)** once **all** are disabled. A breaker sentinel is re-checked
+  each daemon wake, so `--reset` re-enables without a restart.
+- **Balance gate never spends credits by default.** `_caw_plan_exhausted` keys on
+  the **starter's own model** (changing `--model` changes which weekly bucket
+  governs). Don't widen it back to "any weekly cap at 100%" — a maxed Fable cap
+  must not suppress a plan-covered haiku starter. The skip is a clean rc 0, not an
+  error.
 - **Teardown is unconditional.** `kill-session` by unique name + transcript
   cleanup run in the `always {}` block regardless of success/timeout.
 - **Isolated tmux socket** (`-L claude-auto-window`) — never touch the user's real
@@ -91,9 +143,11 @@ functions are the `claude-auto-window*` names.
 - **Circuit breaker must not be defeated.** `_caw_breaker_*` count consecutive
   opens that never register a window; after `CLAUDE_AUTO_WINDOW_MAX_FAILURES`
   (default 3) it trips: notify once + persistent trip file + stop (once returns 3,
-  daemon exits cleanly, cron no-ops, both stay stopped across restarts until
-  `--reset`). The counter **resets on a confirmed-open cycle** and increments
-  **once per fire attempt** (post-cooldown, post-weekly-guard) — keep it that way,
+  cron no-ops, both stay stopped across restarts until `--reset`; the daemon
+  **disables that profile** — until its sentinel clears — and exits cleanly only
+  once every profile is disabled). The counter **resets on a confirmed-open cycle**
+  and increments
+  **once per fire attempt** (post-cooldown, post-balance-gate) — keep it that way,
   or normal operation would false-trip or a fault would never trip. Runtime state
   lives in a **durable** dir (`$XDG_STATE_HOME/claude-auto-window/`): a per-profile
   `<hash>.state` key=value file (`_caw_state_get/set/del`) holds `failcount`,
@@ -103,7 +157,8 @@ functions are the `claude-auto-window*` names.
 - **No 5h window ⇒ do nothing.** `_caw_session_active` returns **2** when the
   account has no `session` limit (API/usage-billed seat). `-once` turns that into
   exit **70** (safe no-op, never "closed → open" — that would spend money per
-  token), and the **daemon exits cleanly** on 70. `--run` keeps exactly **one**
+  token), and the **daemon disables that profile** on 70 (lifetime; exits cleanly
+  once all profiles are disabled). `--run` keeps exactly **one**
   guard — it refuses (exit 70) only on the no-window case, fails **open** on every
   other state (active/closed/undetermined) so it stays "just do it", and
   `--force` / `CLAUDE_AUTO_WINDOW_FORCE=1` bypasses even that. Do not add the
@@ -118,6 +173,14 @@ post-open verify never returns this — a received reply is treated as success) 
 `70` account has no 5-hour window (checked-path no-op; the **daemon exits
 cleanly** so systemd leaves it stopped) · `75` another instance holds the
 per-profile lock.
+
+**Multi-profile aggregation:** the iterated modes (`--once`/`--run`/`--status`/
+`--reset`) run every profile and return the **first** non-zero rc seen. The daemon
+maps per-profile rc's to its disable map rather than exiting: **70** ⇒ disable
+that profile for the daemon's lifetime; **3** ⇒ disable until the sentinel clears
+(re-checked each wake); **2** is still fatal (config/usage-parse); **75** (locked)
+and transient errors just skip that profile this wake. The daemon's own process
+exit is **0** once all profiles are disabled.
 
 ## Testing without spending real tokens
 
@@ -190,4 +253,12 @@ per-profile lock.
   (`${${TMPDIR:-/tmp}%/}`), don't reintroduce a `//`.
 - **Transcript cleanup uses a recursive glob by session UUID**, so it works
   regardless of how Claude slugifies the cwd into a `projects/<slug>` folder.
+- **A profile with no stored credentials is NOT a lifetime-disable.** No creds ⇒
+  `_caw_resolve_token` returns 1 → the check is `undetermined` (rc 3), so the
+  daemon **retries it each wake** rather than disabling it (a real breaker trip is
+  a distinct sentinel). It **self-heals** the moment you `claude`-log-in that
+  profile. Only rc 70 (genuinely no 5h window) disables for the daemon's lifetime.
+- **The balance gate keys on the starter's OWN model.** `--model` changes which
+  model-scoped weekly bucket `_caw_plan_exhausted` consults alongside `weekly_all`
+  — a different-model scoped cap (e.g. Fable) does not govern a haiku starter.
 - **Don't `sudo`** anything here; it's all user-scoped.
