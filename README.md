@@ -2,10 +2,19 @@
 
 Keep a **Claude Code 5-hour usage window** perpetually open — back to back — so
 there's no cold-start wait the moment you actually want to use Claude. When the
-current window has lapsed, it opens a fresh one by driving a *real interactive*
-Claude Code session inside a throwaway **tmux** session: send one trivial prompt,
-wait for the reply, quit, and tear the session down. That single request anchors
-a new 5-hour window at minimal token cost.
+current window has lapsed, it opens a fresh one with a single trivial request.
+That one request anchors a new 5-hour window at minimal token cost.
+
+There are **two opener strategies** (`--opener`):
+
+- **`http`** (default) — replicate the request Claude Code itself sends: **one raw
+  `POST /v1/messages`** using the OAuth token Claude Code already stored, spoofing
+  the Claude Code identity so the subscription token is accepted. **No tmux, no
+  `claude` binary** — just `curl`. Falls back to the `tmux` opener when the token
+  needs refreshing. See *Opener strategies*.
+- **`tmux`** — drive a *real interactive* Claude Code session in a throwaway
+  **tmux** session: send one trivial prompt, wait for the reply, quit, tear it
+  down. Most faithful, and it self-heals an expired token on its own.
 
 Useful if you're on a **Claude Pro/Max** plan and want your 5-hour windows to
 roll continuously (e.g. overnight, or on a always-on box) so you never lose time
@@ -33,20 +42,24 @@ waiting for a new window to start after you hit a limit.
 3. **Stop if open** — a window is already running → do nothing.
 4. **Jitter** — window closed → wait `0..jitter-max` seconds (default 180), then
    re-check (normal activity during the jitter may have already opened one).
-5. **Open a tmux session** — unique name on an isolated socket
-   (`-L claude-auto-window`), never touching your real tmux server.
-6. **Run** `claude "Reply with exactly: OK."` **directly** as the pane's process
-   (not typed into a shell, so there's no command-echo noise), as light as
-   possible (see *Minimal footprint*).
-7. **Wait for the reply** — poll `capture-pane`, filter out the prompt-echo
-   lines, and match Claude's own reply (`OK.`). If the first-run
-   **workspace-trust dialog** appears, it's accepted automatically (Enter → the
-   default "Yes, I trust this folder") — safe because the starter dir is a
-   dedicated dir you own.
-8. **Quit** — send `/exit`; if still running, `Ctrl-C Ctrl-C`; then
-   `kill-session` by name unconditionally (in an `always` block).
-9. **Clean up** — delete the starter's own transcript, verify the window flipped
-   active.
+5. **Open a window** using the selected opener. The default **`http`** opener is
+   a single `POST /v1/messages` (see *Opener strategies*); with **`--opener tmux`**
+   this expands to the full interactive-session dance (steps 5a–5e):
+   - **5a. Open a tmux session** — unique name on an isolated socket
+     (`-L claude-auto-window`), never touching your real tmux server.
+   - **5b. Run** `claude "Reply with exactly: OK."` **directly** as the pane's
+     process (not typed into a shell, so there's no command-echo noise), as light
+     as possible (see *Minimal footprint*).
+   - **5c. Wait for the reply** — poll `capture-pane`, filter out the prompt-echo
+     lines, and match Claude's own reply (`OK.`). If the first-run
+     **workspace-trust dialog** appears, it's accepted automatically (Enter → the
+     default "Yes, I trust this folder") — safe because the starter dir is a
+     dedicated dir you own.
+   - **5d. Quit** — send `/exit`; if still running, `Ctrl-C Ctrl-C`; then
+     `kill-session` by name unconditionally (in an `always` block).
+   - **5e. Clean up** — delete the starter's own transcript.
+6. **Verify** the window flipped active (best-effort; the usage endpoint lags a
+   few minutes, so a received reply / HTTP 200 is already treated as success).
 
 A per-profile lock prevents two starters racing for the same account, and a
 **balance gate** skips the starter when the plan bucket that would cover it is
@@ -55,11 +68,122 @@ see *Balance gate*). One daemon (or one `--once`/`--run`/`--status`/`--reset`)
 can service several profiles at once, each checked and opened independently —
 see *Profiles (multi-account)*.
 
+## Opener strategies
+
+The step that actually anchors a window is pluggable via `--opener`
+(`CLAUDE_AUTO_WINDOW_OPENER`). Both anchor a window identically — a completed
+request on the subscription OAuth login — they differ only in *how* that request
+is made.
+
+| | `http` (default) | `tmux` |
+|---|---|---|
+| Mechanism | One raw `POST /v1/messages` via `curl` | Real interactive `claude` in a throwaway tmux session |
+| Needs | `curl` + `jq` only | `tmux` **+** the `claude` binary |
+| Footprint | A single HTTP round-trip (~1 s) | Full TUI launch, pane polling, teardown |
+| Expired-token self-heal | Delegates to `tmux` (see below) | Built in (the launch refreshes the token) |
+| Trust dialog / transcript | N/A (no session created) | Handled / cleaned |
+
+**Why `http` works.** A subscription OAuth token is normally rejected on
+`/v1/messages`. Claude Code gets it accepted by presenting as itself, and the
+`http` opener replicates exactly that:
+
+- header `anthropic-beta: oauth-2025-04-20`, and
+- a `system` prompt whose first block is **exactly**
+  `You are Claude Code, Anthropic's official CLI for Claude.`
+
+With both present the token is accepted and the completed request anchors the
+window — no API key, nothing billed beyond the tiny message (which the balance
+gate already governs).
+
+**The one thing `http` can't do — and the fallback.** Only a real `claude`
+launch can refresh an expired access token (via the stored refresh token). So
+when the token is expired/absent, or the request is auth-rejected (`401/403`),
+the `http` opener **automatically falls back to the `tmux` opener**, which
+self-heals the token and sends. Net effect: `http` is the light fast-path for the
+common case (token still valid — the vast majority of fires), with `tmux` as the
+safety net. That's also why the daemon's existing expired-token self-heal
+(bare prompt-less `claude` launch, step 2) still runs *before* the opener under
+`--once`/`--daemon`, so `http` usually finds a fresh token waiting.
+
+**Model note.** The `http` opener needs a **concrete** API model id
+(`--http-model`, default `claude-haiku-4-5-20251001`) — the CLI's `haiku` *alias*
+(`--model`) is not a valid API model id. If the configured http model is retired,
+the request falls back to the `tmux` opener (which understands aliases and the
+account default).
+
+```sh
+# http is the default — a window is anchored via a single HTTP request:
+claude-auto-window --run
+# Fall back to the interactive tmux opener explicitly if you ever need it:
+claude-auto-window --run --opener tmux
+```
+
+## claude-profile integration (serial / multi-subscription accounts)
+
+[claude-profile](https://github.com/deviationist/claude-profile) runs several
+subscriptions ("accounts") inside **one** Claude Code config dir, swapping only
+the OAuth credential — one account is *live* in the dir at a time, the rest
+*parked*. claude-auto-window keeps **every** account's 5-hour window open at once,
+including the parked ones.
+
+**Why this needs the http opener.** A parked account's window **cannot** be
+anchored by the `tmux` opener: a real `claude` launch always uses whichever
+account is *live* in the dir, never a parked one. Anchoring a parked account
+requires an HTTP request carrying *that account's* token — with no session and no
+credential swap. That request lives inside claude-profile (which alone can safely
+mint a fresh token per account, live or parked, under its mutation lock) as its
+`anchor-window` porcelain, so **the token never leaves claude-profile**.
+claude-auto-window stays the orchestrator: it discovers accounts, applies the same
+window-check / balance-gate / breaker / cooldown / jitter logic *per account*, and
+delegates the anchor. **Serial/parked support is therefore http-only by
+construction.**
+
+Controlled by `--claude-profile` (`CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE`):
+
+| Mode | Behavior |
+|---|---|
+| `auto` (default) | If claude-profile's config + script are found, keep every account's window open (parked included). Otherwise behave traditionally. |
+| `on` | Require claude-profile (warn if its config/script is missing). |
+| `off` | Ignore claude-profile entirely — pure single-window behavior on each dir's *live* credential. The escape hatch. |
+
+With no `--profile`/`--config-dir` given and claude-profile active, the default
+target set becomes **every account across every claude-profile profile**. An
+explicit `--profile NAME` restricts to that profile's accounts (and its dir is
+resolved from claude-profile's own config, so the two tools never disagree).
+
+- **Requirement:** claude-profile installed with its `anchor-window` porcelain
+  (`claude-profile anchor-window …`). claude-auto-window invokes `claude-profile.py`
+  by path (auto-discovered; override with `--claude-profile-py`), since the daemon
+  runs headless where the zsh `claude-profile` function isn't sourced.
+- **Division of labor:** claude-profile's own keep-alive daemon renews *refresh
+  tokens* (week-scale); claude-auto-window anchors *5-hour windows*. Complementary,
+  not overlapping.
+- **Live-account fallback:** if the *live* account's token has lapsed, the anchor
+  falls back to a `tmux` launch in the dir (which refreshes it and anchors). Parked
+  accounts have no such fallback — an aged-out parked refresh token needs
+  `claude-profile auth <account>`.
+
+```sh
+# Keep BOTH subscriptions' windows open (parked one included), no rotation:
+claude-auto-window --run          # or --daemon
+claude-auto-window --status       # one block per account
+# Force pure single-window (traditional) behavior:
+CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE=off claude-auto-window --status
+```
+
 ## Requirements
 
-- **zsh**, **tmux**, **jq**, **curl**
-- **Claude Code** (`claude`) logged in for the profile you want kept open.
+- **zsh**, **jq**, **curl** — always (the default `http` opener needs only these).
+- **tmux** + the **`claude`** binary — for the `--opener tmux` strategy, and as
+  the default `http` opener's expired-token fallback. The `http` fast path needs
+  neither, but keep them installed unless you're certain the token will always be
+  fresh (i.e. the account sees regular Claude activity).
+- **Claude Code** logged in for the profile you want kept open (this is what
+  stores the OAuth token both openers read).
 - A **Claude Pro/Max** account (see note above).
+- **Optional: [claude-profile](https://github.com/deviationist/claude-profile)**
+  — only if you keep multiple subscriptions in one config dir and want *all*
+  their windows held open. See *claude-profile integration*.
 
 ### Authentication
 
@@ -129,29 +253,33 @@ set, so Claude Code resolves `~/.claude` exactly as a bare `claude` call would.
 Any other profile is an absolute config dir, pinned via `CLAUDE_CONFIG_DIR` only
 for that profile's launch.
 
-Three ways to name profiles (a name is `default` | `personal` | `work` | an
-absolute dir):
+Three ways to name profiles (a name is `default`, an absolute dir, or a
+**claude-profile profile name**):
 
 ```sh
 # 1. Repeatable CLI flags — accumulate in order:
-claude-auto-window --profile personal --profile work
 claude-auto-window --profile default --config-dir /path/to/prof   # mix freely
+claude-auto-window --profile work --profile personal   # names from claude-profile
 
 # 2. The PROFILES env/config knob — comma- and/or space-separated:
-CLAUDE_AUTO_WINDOW_PROFILES="personal work" claude-auto-window
+CLAUDE_AUTO_WINDOW_PROFILES="work personal" claude-auto-window
 
 # 3. Legacy single pin (still honoured):
 CLAUDE_AUTO_WINDOW_CONFIG_DIR=~/.claude-personal claude-auto-window
 ```
 
-- `personal` → `~/.claude-personal`, `work` → `~/.claude`, `default` → `~/.claude`
-  (unpinned).
+- `default` → `~/.claude` (unpinned). Any other **name** is resolved from
+  [claude-profile](https://github.com/deviationist/claude-profile)'s own
+  `config.json` (defined per-machine there, not hardcoded here) — so
+  `--profile work` / `--profile personal` work when your claude-profile config
+  defines them. Without claude-profile, only `default` and absolute paths are
+  valid names.
 - **Precedence:** CLI `--profile`/`--config-dir` (repeatable) > `CLAUDE_AUTO_WINDOW_PROFILES`
   > legacy `CLAUDE_AUTO_WINDOW_CONFIG_DIR` (single) > fallback `default`. (Note the
   change: `--config-dir` no longer silently wins over `--profile` — they now
   accumulate together.)
-- **Dedup by resolved dir, first wins.** `--profile work --profile default` both
-  resolve to `~/.claude`, so the repeat is dropped with a WARN.
+- **Dedup by resolved dir, first wins.** `--profile default --config-dir ~/.claude`
+  both resolve to `~/.claude`, so the repeat is dropped with a WARN.
 
 When a daemon services several profiles, it disables them individually (a maxed
 account or a tripped breaker stands that one profile down without touching the

@@ -20,13 +20,22 @@
 
   Change --profile default to target another Claude profile (see README).
 
+  claude-profile integration: if claude-profile is installed and its config dir
+  holds several subscriptions ("accounts"), --profile default AUTO-EXPANDS to keep
+  EVERY account's window open (parked ones included, via HTTP) — no plist change
+  needed. Set CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE=off in EnvironmentVariables to
+  force plain single-window behavior. See README → claude-profile integration.
+
   Multi-account (the macOS win — ONE plist holds N logins open): --profile is
-  repeatable, so add more pairs to ProgramArguments. e.g. to keep both the
-  default and a personal login open, the array becomes:
+  repeatable, so add more pairs to ProgramArguments. e.g. to keep the default
+  plus another login open, the array becomes (NAME is `default`, an absolute
+  dir, or a claude-profile profile name — defined per-machine in claude-profile;
+  and if one dir holds several subscriptions, --profile default already
+  auto-expands to all of them, so extra pairs are often unnecessary):
 
     <string>--daemon</string>
     <string>--profile</string><string>default</string>
-    <string>--profile</string><string>personal</string>
+    <string>--profile</string><string>NAME</string>
     <string>--log</string>
     <string>__HOME__/.local/state/claude-auto-window/daemon.log</string>
 
@@ -38,7 +47,7 @@
   --profile default below) to hold two logins open from this one agent:
 
   <string>--profile</string><string>default</string>
-  <string>--profile</string><string>personal</string>
+  <string>--profile</string><string>NAME</string>
 -->
 <plist version="1.0">
 <dict>
