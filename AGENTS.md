@@ -6,10 +6,21 @@ that are easy to break, and how to test without burning tokens.
 ## What this is
 
 A single zsh tool that keeps a **Claude Code 5-hour usage window** perpetually
-open. When the window has lapsed it opens a fresh one by driving a **real
-interactive** Claude Code session inside a throwaway **tmux** session (send a
-trivial prompt → wait for the reply → quit → tear down). It is deliberately
-**not** the headless `claude -p` approach — `-p` does not open a 5-hour window.
+open. When the window has lapsed it opens a fresh one with a single trivial
+request, via one of **two opener strategies** (`CLAUDE_AUTO_WINDOW_OPENER` /
+`--opener`):
+
+- **`http`** (default) — replicate the request Claude Code sends: one raw
+  `POST /v1/messages` with the stored OAuth token, spoofing the Claude Code
+  identity so the subscription token is accepted (no tmux, no `claude` binary).
+  Falls back to `tmux` when the token needs refreshing.
+- **`tmux`** — drive a **real interactive** Claude Code session in a throwaway
+  **tmux** session (send a trivial prompt → wait for the reply → quit → tear
+  down). Deliberately **not** the headless `claude -p` approach — `-p` does not
+  open a 5-hour window.
+
+Both anchor a window identically (a completed request on the OAuth login); they
+differ only in transport.
 
 ## Files
 
@@ -30,10 +41,13 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
   the repeat) from, in precedence order: repeatable CLI `--profile`/`--config-dir`
   > `CLAUDE_AUTO_WINDOW_PROFILES` (comma/space list) > legacy single
   `CLAUDE_AUTO_WINDOW_CONFIG_DIR` > fallback `default`. A **spec** is either the
-  literal `default` (unpinned) or an absolute dir. Helpers: `_caw_profile_spec
-  NAME` (name→spec, prints — `personal`→`~/.claude-personal`, `work`/`default`→
-  `~/.claude` spec), `_caw_profile_dir SPEC` (spec→concrete check dir; `default`→
-  `~/.claude`), `_caw_pin_profile SPEC` (`default` ⇒ **unset**
+  literal `default` (unpinned), an absolute dir, or a `cpacct:<account>:<dir>`
+  account spec (see claude-profile integration). Helpers: `_caw_profile_spec
+  NAME` (name→spec; `default` stays `default`, an absolute path passes through,
+  any other name is resolved from **claude-profile's config** — no hardcoded
+  `personal`/`work` builtins), `_caw_profile_dir SPEC` (spec→concrete check dir /
+  state key; `default`→`~/.claude`, `cpacct:`→account pseudo-key),
+  `_caw_pin_profile SPEC` (`default` ⇒ **unset**
   `CLAUDE_AUTO_WINDOW_CONFIG_DIR`; else pin it) called once before each profile's
   single-profile body runs.
 - **Iterated modes are thin wrappers.** `claude-auto-window-{once,run,status,reset}`
@@ -66,12 +80,30 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
   - `_caw_status_one` — print the current session state **plus the balance-gate
     verdict** (`weekly_all=NN% → would fire / WOULD SKIP`, starter model, credits
     line, stored-vs-live `resets_at`) — the daemon health-check.
-- **Both `-run` and `-once` open a window via** `_caw_open_window` → which calls
-  `_caw_send_starter` and adds the **cheapest-model-with-fallback** retry.
-- **`_caw_send_starter`** is the heavy lifter: build launch argv → `tmux
-  new-session` running `claude` directly → `_caw_wait_reply` (also auto-accepts
-  the trust dialog) → `_caw_quit_and_kill` → `_caw_cleanup_transcript`, the last
-  two in an `always {}` block so teardown is guaranteed.
+- **Both `-run` and `-once` open a window via** `_caw_open_window` → a
+  **strategy dispatcher** on `CLAUDE_AUTO_WINDOW_OPENER` (`tmux` default | `http`).
+  It calls the matching wrapper, then stamps `_caw_mark_opened` on success (rc 0).
+  - **`_caw_open_window_tmux`** — `_caw_send_starter` + the
+    **cheapest-model-with-fallback** retry (rc 4 → retry on the account default).
+  - **`_caw_open_window_http`** — `_caw_send_starter_http` with a **concrete**
+    model id (`CLAUDE_AUTO_WINDOW_HTTP_MODEL`, default `claude-haiku-4-5-20251001`;
+    the CLI's `haiku` *alias* is NOT a valid API id). A rejected model (rc 6) is
+    mapped to rc 5 = "defer to tmux".
+  - **Fallback:** when `_caw_open_window_http` returns **5** (no/expired token, or
+    `401/403` auth-reject, or model rejected), the dispatcher runs
+    `_caw_open_window_tmux` instead — because only a real `claude` launch can
+    refresh the token. So `http` is the light fast-path; `tmux` is the safety net.
+- **`_caw_send_starter_http`** is the `http` opener: `_caw_resolve_token` → build a
+  minimal `/v1/messages` body (spoofing Claude Code — see Invariants) → one `curl`
+  → HTTP 200 with a completion = window anchored. Return codes: `0` anchored,
+  `4` sent-but-no-completion / network (breaker-countable, like tmux no-reply),
+  `5` defer-to-tmux (token unusable / auth-rejected), `6` model rejected, `2`
+  config error (missing `curl`/`jq`). **The access token is resolved into a local
+  and NEVER logged.**
+- **`_caw_send_starter`** is the `tmux` opener's heavy lifter: build launch argv →
+  `tmux new-session` running `claude` directly → `_caw_wait_reply` (also
+  auto-accepts the trust dialog) → `_caw_quit_and_kill` → `_caw_cleanup_transcript`,
+  the last two in an `always {}` block so teardown is guaranteed.
 - **`_caw_refresh_token`** is the free self-heal for an expired access token:
   the same tmux launch **minus the prompt and model** (nothing sent → no window
   opened, nothing spent), waiting for `_caw_resolve_token` to turn fresh instead
@@ -97,6 +129,38 @@ trivial prompt → wait for the reply → quit → tear down). It is deliberatel
   This replaced the too-blunt `_caw_weekly_exhausted` (skipped on *any* weekly cap
   at 100%, wrongly suppressing a cheap haiku starter when only Fable was maxed).
 
+- **claude-profile integration** (`_caw_cp_*`, `_caw_*_account`) — keep serial /
+  parked subscriptions' windows open. claude-profile runs several accounts in one
+  config dir (one live, rest parked); a parked account's window is anchorable
+  ONLY over HTTP (a `claude` launch always uses the live account), so this is
+  **http-only by construction** and delegated to `claude-profile anchor-window`
+  (token never leaves claude-profile). Shape:
+  - **Discovery/expansion** in `_caw_resolve_profiles`: when `_caw_cp_active`
+    (config + script found, unless `CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE=off`), each
+    claude-profile profile dir is expanded — account-ful → one `cpacct:<acct>:<dir>`
+    spec per account; account-less → a plain dir-target. So multi-profile (dirs)
+    AND serial (accounts) both work, mixed too. `_caw_profile_spec` also resolves
+    names via claude-profile's config (so `--profile personal` matches
+    claude-profile's own dir; the old hardcoded `personal`/`work` builtins were
+    removed — names are defined per-machine in claude-profile, not here).
+  - **Keying:** an account target is keyed by an absolute pseudo-path
+    `<dir>/@account/<acct>` (`_caw_account_key`). Because every state/lock/breaker/
+    cooldown helper keys off `sha256(${arg:a})`, passing this pseudo-key reuses ALL
+    of them unchanged, and `_caw_profile_dir` returns it for `cpacct:` specs so the
+    daemon/iterators (which treat that value as an opaque key) need **zero**
+    changes.
+  - **Dispatch:** `_caw_once_one`/`_caw_run_one`/`_caw_status_one`/`_caw_reset_one`
+    each start with a one-line guard → `_caw_*_account` when `CLAUDE_AUTO_WINDOW_CP_ACCOUNT`
+    is pinned. The existing bodies are **byte-for-byte** the dir path.
+  - **Per-account bodies** mirror the dir path but source the window state from
+    `_caw_cp_usage_json` (parses `claude-profile usage-json --account X`) and anchor
+    via `_caw_cp_anchor` (`claude-profile anchor-window`). The LIVE account keeps a
+    tmux self-heal fallback (`_caw_cp_anchor` rc 5 → `_caw_open_window`); parked
+    accounts have none (structural).
+  - **Not obsolete:** the v1.1.0 multi-*dir* substrate (`--profile`/`--config-dir`/
+    `PROFILES`, spec→pin→env) is the foundation this builds on — untouched, still
+    the mechanism for multiple config dirs.
+
 All private helpers are prefixed **`_caw_`** (claude-auto-window). Public
 functions are the `claude-auto-window*` names.
 
@@ -112,11 +176,29 @@ functions are the `claude-auto-window*` names.
 - **Reply detection filters the prompt echo, then matches the reply.** See
   `_caw_wait_reply`: it drops lines containing the prompt prefix, then counts the
   expected token in what remains. Do not go back to a raw substring count.
-- **`--safe-mode` is load-bearing**, not cosmetic: it's what strips
+- **`--safe-mode` is load-bearing** (tmux opener), not cosmetic: it's what strips
   CLAUDE.md/skills/hooks/MCP/etc. `--bare` is tempting but **disables OAuth** →
   unusable here (we rely on the subscription login).
-- **Default model is the `haiku` alias**, not a pinned id — aliases survive model
-  rotation. Keep the fallback-to-account-default retry on no-reply.
+- **http opener: the Claude Code spoof is mandatory and exact.** The OAuth token
+  is only accepted on `/v1/messages` with BOTH (1) header
+  `anthropic-beta: oauth-2025-04-20` and (2) a `system` first block that is
+  **character-for-character** `You are Claude Code, Anthropic's official CLI for
+  Claude.` Change either and the token is rejected (`401/403`). Do **not** add an
+  `x-api-key`/`ANTHROPIC_API_KEY` path — that bills separately and does not anchor
+  the subscription window (the tmux opener already strips those env vars for the
+  same reason).
+- **http opener never logs the token.** `_caw_resolve_token`'s output goes into a
+  local and only into the `Authorization` header. Keep it that way.
+- **http opener falls back to tmux for token refresh.** Only a real `claude`
+  launch refreshes an expired access token, so `_caw_send_starter_http` must
+  return **5** (not fire blind) on missing/expired token or `401/403`, and the
+  dispatcher must route rc 5 to `_caw_open_window_tmux`. Don't implement an OAuth
+  refresh in the script (same rationale as `_caw_refresh_token`).
+- **Default model is the `haiku` alias** for the tmux opener, not a pinned id —
+  aliases survive model rotation. Keep the fallback-to-account-default retry on
+  no-reply. **The http opener cannot use an alias** — it needs a concrete API id
+  (`CLAUDE_AUTO_WINDOW_HTTP_MODEL`); a rejected id (rc 6) defers to tmux, which
+  does understand aliases + the account default.
 - **Profile passthrough:** the `default` spec means `CLAUDE_CONFIG_DIR` is
   **never set** — Claude Code resolves `~/.claude` on its own. Only an absolute-dir
   spec pins it (`_caw_pin_profile`). Do not set `CLAUDE_CONFIG_DIR` for `default`.
@@ -168,8 +250,9 @@ functions are the `claude-auto-window*` names.
 
 `0` ok · `1` general error · `2` config/usage-parse error (fatal in daemon) ·
 `3` circuit breaker tripped (checked path refuses; **daemon exits cleanly**) ·
-`4` starter sent but **no reply** (real failure, from `_caw_send_starter`; the
-post-open verify never returns this — a received reply is treated as success) ·
+`4` starter sent but **no reply / no completion** (real failure, from
+`_caw_send_starter` or `_caw_send_starter_http`; the post-open verify never
+returns this — a received reply / HTTP 200 is treated as success) ·
 `70` account has no 5-hour window (checked-path no-op; the **daemon exits
 cleanly** so systemd leaves it stopped) · `75` another instance holds the
 per-profile lock.
@@ -203,6 +286,11 @@ exit is **0** once all profiles are disabled.
 - **Live (spends a tiny Haiku turn, opens/uses a window):** `--run`. Only do this
   intentionally. `--run` fires even if a window is already open, so it validates
   the mechanism (prompt → reply → teardown) without waiting for a reset.
+  Add `--opener http` to validate the raw `POST /v1/messages` path (expect
+  `HTTP opener: request completed (stop_reason='end_turn') → window anchored`),
+  and force the http→tmux fallback with a bogus `--http-model` (expect the model
+  `404` → `deferring to tmux opener` → the tmux starter replies). Both were
+  validated live 2026-07-27.
 - **The one path that needs a *closed* window:** `--once` opening a *fresh*
   window — only meaningful after the current 5h window has reset.
 
@@ -213,6 +301,13 @@ exit is **0** once all profiles are disabled.
   returns the **raw** response (not the standalone `claude-usage` CLI's normalized
   `--json` shape — note the field is `is_active`, not `active`). If the schema
   changes, the `.limits[] … kind=="session"` parse is what to fix.
+- **http opener is an unofficial spoof.** Getting a *subscription* OAuth token
+  accepted on `/v1/messages` by presenting as Claude Code (beta header + identity
+  system prompt) is reverse-engineered, not a supported API. Anthropic could
+  change the acceptance rule at any time; if the http opener starts returning
+  `401/403`, that's the likely cause — the rc-5 fall-back to the tmux opener keeps
+  the tool working in the meantime, and `--opener tmux` is the escape hatch. Don't
+  treat the spoof as a stable contract.
 - **`is_active` is NOT "is a window open" — and we don't read it.** It tracks
   recent activity, so an open-but-idle window reads `is_active:false`. The only
   signal we use is **`resets_at` in the future**. Keying on `is_active` was a real

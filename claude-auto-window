@@ -3,15 +3,24 @@
 # claude-auto-window — keep a Claude five-hour usage window perpetually open
 # ============================================================================
 # Goal: always have a 5-hour session window running, back to back, spending as
-# few tokens as possible. When a window has lapsed, this opens a fresh one by
-# driving a *real interactive* Claude Code session inside a throwaway tmux
-# session — send one trivial prompt, wait for the reply, quit, tear the tmux
-# session down. That single request is enough to anchor a new 5-hour window,
-# so the next time you actually need Claude there is no cold-start wait.
+# few tokens as possible. When a window has lapsed, this opens a fresh one with
+# a single trivial request — that one request is enough to anchor a new 5-hour
+# window, so the next time you actually need Claude there is no cold-start wait.
 #
-# This is deliberately NOT the headless `claude -p` approach (see
-# ../claude-auto-window-old for that Codex-authored variant) — we drive the
-# genuine TUI path through tmux instead.
+# Two opener strategies (CLAUDE_AUTO_WINDOW_OPENER / --opener):
+#   http (default) — replicate the request Claude Code itself sends: one raw
+#     POST /v1/messages authenticated with the stored OAuth token, spoofing the
+#     Claude Code identity (beta header + system prompt) so the subscription
+#     token is accepted. No tmux, no claude binary — the lightest path. Falls
+#     back to the tmux opener when the token is expired/absent (only a real
+#     claude launch refreshes it) or the request is auth-rejected. Validated
+#     live 2026-07-27.
+#   tmux — drive a *real interactive* Claude Code session inside a throwaway
+#     tmux session: send one prompt, wait for the reply, quit, tear the session
+#     down. Heaviest, but the most faithful path, and it self-heals an expired
+#     access token on its own. This is deliberately NOT the headless `claude -p`
+#     approach (see ../claude-auto-window-old for that variant) — we drive the
+#     genuine TUI path through tmux.
 #
 # The window check reads Claude Code's own OAuth usage endpoint directly (token
 # resolution + fetch are inlined below) — no Anthropic API key required.
@@ -30,8 +39,10 @@
 #   N logins open, each checked independently against its own stored OAuth login
 #   with per-profile failure isolation:
 #     --config-dir PATH   explicit Claude profile dir (sets CLAUDE_CONFIG_DIR)
-#     --profile NAME      default | personal | work | <abs path>
-#   Or set CLAUDE_AUTO_WINDOW_PROFILES="personal work" (comma/space list) once.
+#     --profile NAME      default | <abs path> | a claude-profile profile name
+#   (profile NAMES other than `default` are resolved from claude-profile's config
+#    — github.com/deviationist/claude-profile — so they're defined per-machine
+#    there, not hardcoded here.) Or set CLAUDE_AUTO_WINDOW_PROFILES="a b" once.
 #
 # Balance gate
 #   We only anchor a window when the STARTER's own model is still plan-covered
@@ -52,7 +63,7 @@
 #   source ./claude-auto-window && claude-auto-window-once
 # ============================================================================
 
-typeset -g CLAUDE_AUTO_WINDOW_VERSION="1.1.0"
+typeset -g CLAUDE_AUTO_WINDOW_VERSION="1.3.0"
 
 # ----------------------------------------------------------------------------
 # Logging — stdout/stderr always; append to $CLAUDE_AUTO_WINDOW_LOG if opted in.
@@ -199,10 +210,15 @@ _caw_usage_json() {
 # per-profile state file. That stored resets_at is the single source of truth for
 # "when to act next": both the --once early-exit and the daemon's sleep read it.
 # (It also self-documents which subscription the opaque <hash>.state belongs to.)
-_caw_session_active() {
+# Decide open/closed from already-fetched usage JSON, recording resets_at under
+# a given STATE KEY on a confirmed-open. Same return codes as _caw_session_active
+# minus 4 (no token concept here — the caller fetched the JSON):
+#   0 open (records resets_at), 1 closed, 2 no session window, 3 unparseable.
+# $1 = state key (a dir for dir-targets, or an account pseudo-key), $2 = usage
+# JSON, $3 = profile label to record (optional; defaults to the key).
+_caw_session_from_json() {
   emulate -L zsh
-  local dir="$1" json has sess resets now rc
-  json="$(_caw_usage_json "$dir")" || { rc=$?; (( rc == 4 )) && return 4; return 3; }
+  local key="$1" json="$2" label="${3:-$1}" has sess resets now
   [[ -n "$json" ]] || return 3
   # Does this account use the 5-hour session-window model at all? Pro/Max do;
   # API/usage-billed (Team/Enterprise/console) seats return no session limit.
@@ -216,11 +232,18 @@ _caw_session_active() {
   # fixed-width YYYY-MM-DDTHH:MM:SS prefix is a correct chronological compare.
   now="$(date -u +%Y-%m-%dT%H:%M:%S)"
   if [[ "${resets:0:19}" > "$now" ]]; then                # future → open
-    _caw_state_set "$dir" profile "$dir"
-    _caw_state_set "$dir" resets_at "$resets"
+    _caw_state_set "$key" profile "$label"
+    _caw_state_set "$key" resets_at "$resets"
     return 0
   fi
   return 1                                                # null / past → closed
+}
+
+_caw_session_active() {
+  emulate -L zsh
+  local dir="$1" json rc
+  json="$(_caw_usage_json "$dir")" || { rc=$?; (( rc == 4 )) && return 4; return 3; }
+  _caw_session_from_json "$dir" "$json" "$dir"
 }
 
 # Convert a UTC ISO-8601 timestamp (e.g. 2026-07-19T06:40:00.351+00:00) to epoch
@@ -298,6 +321,7 @@ _caw_status_line() {
 # profile body; the public claude-auto-window-reset iterates it over all specs.
 _caw_reset_one() {
   emulate -L zsh
+  [[ -n "${CLAUDE_AUTO_WINDOW_CP_ACCOUNT:-}" ]] && { _caw_reset_account; return $?; }
   local dir; dir="$(_caw_check_dir)"
   if _caw_breaker_tripped "$dir"; then
     _caw_breaker_clear "$dir"
@@ -795,10 +819,99 @@ _caw_send_starter() {
   return 0
 }
 
-# Send a starter with the preferred (cheapest) model, falling back once to the
-# account default model if that model got no reply — covers the rare case where
-# the configured model/alias has been retired.
-_caw_open_window() {
+# ----------------------------------------------------------------------------
+# Strategy: HTTP (spoof) — anchor a window with ONE raw POST /v1/messages using
+# the OAuth token Claude Code already stored, no tmux and no claude binary.
+#
+# The subscription OAuth token is only accepted on /v1/messages when the request
+# presents as Claude Code: the `anthropic-beta: oauth-2025-04-20` header AND a
+# system prompt whose first block is EXACTLY the Claude Code identity string.
+# Without both, the backend rejects the token (401/403). A completed request is
+# exactly what anchors a fresh 5-hour window — same as the tmux starter's send,
+# minus the terminal. Validated live 2026-07-27.
+#
+# Signature mirrors _caw_send_starter: $1 = check dir, $2 = show output (1/0),
+# $3 = model (a CONCRETE API model id — the CLI's "haiku" alias is not valid on
+# the API). Return codes:
+#   0 = request completed → window anchored
+#   4 = sent but no usable completion / network error (breaker-countable, like
+#       the tmux no-reply)
+#   5 = cannot proceed over HTTP (no/expired token, or auth rejected) → caller
+#       should fall back to the tmux opener, which self-heals the token and sends
+#   6 = the model id was rejected (retired/unknown) → caller retries / falls back
+#   2 = config error (missing curl/jq, bad max-tokens)
+# The access token is resolved into a local and NEVER logged.
+# ----------------------------------------------------------------------------
+_caw_send_starter_http() {
+  emulate -L zsh
+  local dir="$1" show="${2:-0}" model="$3"
+  local rc token prompt sys body resp code json text stop err maxtok
+  command -v curl >/dev/null 2>&1 || { _caw_log ERROR "curl not found on PATH"; return 2; }
+  command -v jq   >/dev/null 2>&1 || { _caw_log ERROR "jq not found on PATH"; return 2; }
+
+  token="$(_caw_resolve_token "$dir")"; rc=$?
+  if (( rc != 0 )); then
+    # 4 = every stored access token expired; 1/other = none at all. Either way
+    # HTTP can't authenticate — defer to the tmux opener (a real claude launch is
+    # the only thing that refreshes the token, and its send also anchors).
+    _caw_log INFO "HTTP opener: no usable access token (resolve rc $rc) — deferring to tmux opener"
+    return 5
+  fi
+
+  prompt="${CLAUDE_AUTO_WINDOW_PROMPT:-Reply with exactly: OK.}"
+  maxtok="${CLAUDE_AUTO_WINDOW_HTTP_MAX_TOKENS:-16}"
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_HTTP_MAX_TOKENS "$maxtok" || return 2
+  # system[0] MUST be exactly this — it is the load-bearing half of the OAuth
+  # acceptance contract (the beta header is the other half).
+  sys="You are Claude Code, Anthropic's official CLI for Claude."
+  body="$(jq -n --arg m "$model" --arg s "$sys" --arg p "$prompt" --argjson mt "$maxtok" '{
+    model: $m, max_tokens: $mt,
+    system: [ { type: "text", text: $s } ],
+    messages: [ { role: "user", content: $p } ]
+  }')" || { _caw_log ERROR "HTTP opener: failed to build request body"; return 2; }
+
+  _caw_log INFO "HTTP opener: POST /v1/messages (model '$model')"
+  resp="$(curl -s -w $'\n__CAW_HTTP__%{http_code}' --connect-timeout 5 --max-time 30 \
+    "https://api.anthropic.com/v1/messages" \
+    -H "Content-Type: application/json" \
+    -H "anthropic-version: 2023-06-01" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    -H "Authorization: Bearer $token" \
+    -d "$body" 2>/dev/null)"
+  [[ -z "$resp" ]] && { _caw_log WARN "HTTP opener: empty response (network error)"; return 4; }
+  code="${resp##*__CAW_HTTP__}"
+  json="${resp%$'\n'__CAW_HTTP__*}"
+
+  case "$code" in
+    200)
+      text="$(jq -r '[.content[]?.text] | join(" ")' <<< "$json" 2>/dev/null)"
+      stop="$(jq -r '.stop_reason // empty' <<< "$json" 2>/dev/null)"
+      if [[ -n "$stop" || -n "$text" ]]; then
+        _caw_log INFO "HTTP opener: request completed (stop_reason='${stop:-?}') → window anchored"
+        (( show )) && print -r -- "reply: ${text:-<no text>}"
+        return 0
+      fi
+      _caw_log WARN "HTTP opener: HTTP 200 but no completion in body"; return 4 ;;
+    401|403)
+      err="$(jq -r '.error.message // empty' <<< "$json" 2>/dev/null)"
+      _caw_log WARN "HTTP opener: auth rejected ($code${err:+: $err}) — token likely expired; deferring to tmux opener"
+      return 5 ;;
+    400|404)
+      err="$(jq -r '.error.message // empty' <<< "$json" 2>/dev/null)"
+      if print -r -- "$err" | grep -qiE 'model'; then
+        _caw_log WARN "HTTP opener: model '$model' rejected ($code${err:+: $err})"; return 6
+      fi
+      _caw_log WARN "HTTP opener: request rejected ($code${err:+: $err})"; return 4 ;;
+    *)
+      err="$(jq -r '.error.message // empty' <<< "$json" 2>/dev/null)"
+      _caw_log WARN "HTTP opener: unexpected status $code${err:+ ($err)}"; return 4 ;;
+  esac
+}
+
+# tmux strategy wrapper: send with the preferred (cheapest) model, falling back
+# once to the account default model if that model got no reply — covers the rare
+# case where the configured model/alias has been retired.
+_caw_open_window_tmux() {
   emulate -L zsh
   local dir="$1" show="$2" rc primary
   primary="${CLAUDE_AUTO_WINDOW_MODEL-haiku}"
@@ -807,6 +920,42 @@ _caw_open_window() {
     _caw_log WARN "no reply with model '$primary' (retired?); retrying on the account default model"
     _caw_send_starter "$dir" "$show" ""; rc=$?
   fi
+  return $rc
+}
+
+# http strategy wrapper: send via raw HTTP with a concrete model id. A rejected
+# model (rc 6) becomes a fall-back request (rc 5) — the API has no "account
+# default" concept, so the tmux opener (which does) takes over.
+_caw_open_window_http() {
+  emulate -L zsh
+  local dir="$1" show="$2" rc model
+  model="${CLAUDE_AUTO_WINDOW_HTTP_MODEL:-claude-haiku-4-5-20251001}"
+  _caw_send_starter_http "$dir" "$show" "$model"; rc=$?
+  (( rc == 6 )) && { _caw_log WARN "HTTP opener: model '$model' rejected — deferring to tmux opener"; return 5; }
+  return $rc
+}
+
+# Open a window using the selected strategy (CLAUDE_AUTO_WINDOW_OPENER):
+#   http (default) — one raw POST /v1/messages (no tmux, no claude binary)
+#   tmux           — drive a real interactive claude session in a throwaway tmux
+# The http opener falls back to tmux (rc 5) whenever it can't authenticate or
+# the request is rejected — so the token self-heal is preserved either way.
+_caw_open_window() {
+  emulate -L zsh
+  local dir="$1" show="$2" rc
+  local opener="${CLAUDE_AUTO_WINDOW_OPENER:-http}"
+  case "$opener" in
+    tmux)
+      _caw_open_window_tmux "$dir" "$show"; rc=$? ;;
+    http)
+      _caw_open_window_http "$dir" "$show"; rc=$?
+      if (( rc == 5 )); then
+        _caw_log WARN "HTTP opener could not proceed; falling back to the tmux opener (self-heals token + sends)"
+        _caw_open_window_tmux "$dir" "$show"; rc=$?
+      fi ;;
+    *)
+      _caw_log ERROR "unknown CLAUDE_AUTO_WINDOW_OPENER '$opener' (use: tmux | http)"; return 2 ;;
+  esac
   # Reply received ⇒ the request completed ⇒ a window is open. Stamp the cooldown
   # marker so the daemon doesn't re-open during the endpoint's propagation lag.
   (( rc == 0 )) && _caw_mark_opened "$dir"
@@ -833,6 +982,342 @@ _caw_verify_started() {
 }
 
 # ============================================================================
+# claude-profile integration — serial / parked accounts (http-only)
+# ============================================================================
+# claude-profile (github.com/deviationist/claude-profile) runs several
+# subscriptions ("accounts") inside ONE Claude Code config dir, swapping only the
+# OAuth credential; one account is "live" in the dir at a time, the rest "parked".
+#
+# A parked account's window CANNOT be anchored by the tmux opener — a real
+# `claude` launch always uses whatever account is live in the dir, never a parked
+# one. It can only be anchored by an HTTP request carrying THAT account's token.
+# That request lives inside claude-profile (which alone can safely mint a fresh
+# token per account, live or parked, under its mutation lock) as its
+# `anchor-window` porcelain, so the token never leaves it. So: serial/parked
+# support is HTTP-ONLY by construction. claude-auto-window stays the orchestrator
+# — it discovers accounts from claude-profile's config, applies the SAME
+# window-check / balance-gate / breaker / cooldown / jitter logic per account
+# (keyed by an account pseudo-path so every existing state helper is reused
+# unchanged), and delegates the anchor to `claude-profile anchor-window`.
+#
+# Active when CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE is `auto` (default: use it iff its
+# config + script are both found), `on` (require it), or `off` (ignore entirely —
+# the escape hatch back to pure single-window/traditional behavior).
+# ----------------------------------------------------------------------------
+_caw_cp_py() {   # path to claude-profile.py (daemon runs headless; the zsh
+  emulate -L zsh # `claude-profile` function isn't sourced there → invoke directly)
+  local c="${CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE_PY:-}"
+  [[ -n "$c" && -r "$c" ]] && { print -r -- "$c"; return 0; }
+  [[ -n "${_CLAUDE_PROFILE_HOME:-}" && -r "${_CLAUDE_PROFILE_HOME}/claude-profile.py" ]] \
+    && { print -r -- "${_CLAUDE_PROFILE_HOME}/claude-profile.py"; return 0; }
+  local p
+  for p in "$HOME/.zsh/claude-profile/claude-profile.py" \
+           "$HOME/code/claude-profile/claude-profile.py" \
+           "$HOME/code-private/claude-profile/claude-profile.py"; do
+    [[ -r "$p" ]] && { print -r -- "$p"; return 0; }
+  done
+  return 1
+}
+
+_caw_cp_config() {
+  emulate -L zsh
+  print -r -- "${CLAUDE_PROFILE_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/claude-profile/config.json}"
+}
+
+# Active? auto = iff config + script present. on = required (warn if missing).
+_caw_cp_active() {
+  emulate -L zsh
+  local mode="${CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE:-auto}"
+  [[ "$mode" == off ]] && return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  local cfg; cfg="$(_caw_cp_config)"
+  if [[ ! -r "$cfg" ]] || ! _caw_cp_py >/dev/null 2>&1; then
+    [[ "$mode" == on ]] && _caw_log WARN "CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE=on but claude-profile config/script not found"
+    return 1
+  fi
+  return 0
+}
+
+_caw_cp_expand() { emulate -L zsh; local d="$1"; print -r -- "${d/#\~/$HOME}"; }
+
+# Emit "<profile>\t<account>\t<realdir>" for every configured account. (Profiles
+# without an accounts array contribute nothing — their live account is handled as
+# an ordinary dir-target instead.)
+_caw_cp_accounts() {
+  emulate -L zsh
+  local cfg; cfg="$(_caw_cp_config)"
+  [[ -r "$cfg" ]] || return 1
+  local p a d
+  jq -r '.profiles | to_entries[] | .key as $p | (.value.dir // "") as $d
+         | (.value.accounts // [])[] | "\($p)\t\(.)\t\($d)"' "$cfg" 2>/dev/null \
+  | while IFS=$'\t' read -r p a d; do
+      [[ -n "$a" && -n "$d" ]] && printf '%s\t%s\t%s\n' "$p" "$a" "$(_caw_cp_expand "$d")"
+    done
+}
+
+# Account names (one per line) if a real config dir is a claude-profile profile
+# WITH accounts; nothing otherwise.
+_caw_cp_accounts_for_dir() {
+  emulate -L zsh
+  local want="${1%/}" p a d
+  _caw_cp_accounts | while IFS=$'\t' read -r p a d; do
+    [[ "${d%/}" == "$want" ]] && print -r -- "$a"
+  done
+}
+
+# Every claude-profile profile's config dir (one per line), expanded — regardless
+# of whether it declares accounts. Used to seed the no-selection target set so
+# BOTH multi-profile (a dir per single-login profile) and serial (accounts inside
+# a dir) profiles are covered; the resolver's expansion then turns the account-ful
+# ones into per-account targets and leaves the account-less ones as dir-targets.
+_caw_cp_profile_dirs() {
+  emulate -L zsh
+  local cfg d; cfg="$(_caw_cp_config)"
+  [[ -r "$cfg" ]] || return 1
+  jq -r '.profiles[] | .dir // empty' "$cfg" 2>/dev/null \
+  | while IFS= read -r d; do [[ -n "$d" ]] && print -r -- "$(_caw_cp_expand "$d")"; done
+}
+
+# Raw usage JSON for an account (same schema as _caw_usage_json), via the
+# claude-profile porcelain (which refreshes a parked account's token first).
+# Non-zero + no output on any failure (caller treats it as "undetermined").
+_caw_cp_usage_json() {
+  emulate -L zsh
+  local account="$1" py line json
+  py="$(_caw_cp_py)" || return 3
+  line="$(python3 "$py" usage-json --account "$account" 2>/dev/null)" || return 3
+  json="${line#*$'\t'}"
+  [[ -n "$json" && "$json" != "$line" ]] || return 3        # empty field / no tab
+  jq -e 'type=="object" and (.error==null) and (.limits != null)' <<< "$json" >/dev/null 2>&1 || return 3
+  print -r -- "$json"
+}
+
+# Anchor a window for an account via claude-profile. Returns:
+#   0 anchored · 5 LIVE account but its token lapsed (caller may tmux-fallback) ·
+#   4 could not anchor (parked/other) · 2 claude-profile not found.
+_caw_cp_anchor() {
+  emulate -L zsh
+  local account="$1" py out f2 f4
+  py="$(_caw_cp_py)" || { _caw_log ERROR "claude-profile.py not found"; return 2; }
+  out="$(python3 "$py" anchor-window --account "$account" \
+          --model "${CLAUDE_AUTO_WINDOW_HTTP_MODEL:-claude-haiku-4-5-20251001}" \
+          --prompt "${CLAUDE_AUTO_WINDOW_PROMPT:-Reply with exactly: OK.}" 2>/dev/null)"
+  f2="$(cut -f2 <<< "$out")"; f4="$(cut -f4 <<< "$out")"
+  if [[ "$f2" == anchored ]]; then
+    _caw_log INFO "claude-profile anchored a window for account '$account' ($f4)"
+    return 0
+  fi
+  _caw_log WARN "claude-profile could not anchor account '$account': ${out:-<no output>}"
+  [[ "$f4" == live ]] && return 5      # live token lapsed → a claude launch can refresh + anchor
+  return 4
+}
+
+# The account pseudo-path used to key every per-target state helper (lock, state,
+# breaker, cooldown). Absolute, so ${x:a} in the keying helpers leaves it intact,
+# and distinct from the dir's own key so a profile's live-dir target and its
+# account targets never collide.
+_caw_account_key() { emulate -L zsh; print -r -- "${1%/}/@account/${2}"; }
+
+# Guarded per-account cycle (mirror of _caw_once_one, but sourcing the window
+# state from claude-profile and delegating the anchor to it). Dispatched to from
+# _caw_once_one when an account is pinned.
+_caw_once_account() {
+  emulate -L zsh
+  local dir account key rc
+  dir="$(_caw_check_dir)"; account="${CLAUDE_AUTO_WINDOW_CP_ACCOUNT}"
+  key="$(_caw_account_key "$dir" "$account")"
+  local label="account:${account}" model="${CLAUDE_AUTO_WINDOW_MODEL-haiku}"
+  local jitter_max="${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}"
+  local jitter_min="${CLAUDE_AUTO_WINDOW_JITTER_MIN_SECONDS:-0}"
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS "$jitter_max" || return $?
+  _caw_validate_uint CLAUDE_AUTO_WINDOW_JITTER_MIN_SECONDS "$jitter_min" || return $?
+  (( jitter_min > jitter_max )) && jitter_max=$jitter_min
+
+  # Not due yet? A stored resets_at still in the future → exit with no fetch.
+  local _sr _sre
+  if _sr="$(_caw_state_get "$key" resets_at)" && [[ -n "$_sr" ]]; then
+    _sre="$(_caw_iso_to_epoch "$_sr")"
+    if [[ "$_sre" == <-> ]] && (( $(date +%s) < _sre )); then
+      _caw_log INFO "[$account] window open until $_sr — not due yet, exiting"
+      return 0
+    fi
+  fi
+
+  local lock; lock="$(_caw_acquire_lock "$key")"; rc=$?
+  (( rc == 75 )) && return 0
+  (( rc != 0 )) && return "$rc"
+  {
+    if _caw_breaker_tripped "$key"; then
+      _caw_log ERROR "[$account] disabled by sentinel $(_caw_state_file "$key" tripped) ($(_caw_breaker_reason "$key")) — not running. Re-enable: claude-auto-window --reset"
+      return 3
+    fi
+
+    local json; json="$(_caw_cp_usage_json "$account")"; rc=$?
+    (( rc == 0 )) && { _caw_session_from_json "$key" "$json" "$label"; rc=$?; } || rc=3
+    if (( rc == 0 )); then
+      _caw_breaker_reset "$key"
+      _caw_log INFO "[$account] window already open; nothing to do"
+      return 0
+    elif (( rc == 2 )); then
+      _caw_log WARN "[$account] no 5-hour session window on this account — nothing to keep open"
+      return 70
+    elif (( rc == 3 )); then
+      _caw_log ERROR "[$account] could not determine window state (claude-profile usage unavailable)"
+      return 1
+    fi
+
+    if _caw_recently_opened "$key"; then
+      _caw_log INFO "[$account] opened a window recently; endpoint may be catching up — skipping"
+      return 0
+    fi
+    if _caw_plan_exhausted "$json" "$model"; then
+      _caw_log WARN "[$account] weekly plan allowance exhausted for '${model:-<account default>}'; skipping"
+      return 0
+    fi
+
+    local delay; delay=$(( jitter_min + $(_caw_random "$(( jitter_max - jitter_min ))") ))
+    if (( delay > 0 )); then
+      _caw_log INFO "[$account] window closed; jittering ${delay}s (${jitter_min}-${jitter_max}s) before anchor"
+      sleep "$delay"
+    fi
+    if json="$(_caw_cp_usage_json "$account")" && _caw_session_from_json "$key" "$json" "$label"; then
+      _caw_breaker_reset "$key"
+      _caw_log INFO "[$account] window opened during jitter; no anchor needed"
+      return 0
+    fi
+    _caw_plan_exhausted "$json" "$model" && {
+      _caw_log WARN "[$account] weekly plan allowance became exhausted during jitter; skipping"
+      return 0
+    }
+
+    local fails max="${CLAUDE_AUTO_WINDOW_MAX_FAILURES:-3}"
+    _caw_validate_uint CLAUDE_AUTO_WINDOW_MAX_FAILURES "$max" || return $?
+    fails="$(_caw_breaker_count "$key")"
+    if (( fails >= max )); then
+      local reason="${fails} consecutive anchors did not register a 5-hour window"
+      local sentinel; sentinel="$(_caw_state_file "$key" tripped)"
+      _caw_breaker_trip "$key" "$reason"
+      _caw_log ERROR "[$account] circuit breaker TRIPPED: $reason. Disabled via sentinel: $sentinel. Re-enable: claude-auto-window --reset"
+      _caw_notify "claude-auto-window DISABLED for account $account: $reason.
+
+Re-enable with:  claude-auto-window --reset
+(or simply:      rm $sentinel)"
+      return 3
+    fi
+
+    _caw_breaker_inc "$key" >/dev/null
+    _caw_cp_anchor "$account"; rc=$?
+    if (( rc == 5 )); then
+      # LIVE account, token lapsed → a real claude launch in the dir refreshes it
+      # AND anchors the live account (parked accounts can't use this — the launch
+      # would anchor whichever account is live, not the parked one).
+      _caw_log INFO "[$account] live token lapsed — falling back to a tmux launch to refresh + anchor"
+      _caw_open_window "$dir" 0; rc=$?
+    fi
+    (( rc == 0 )) || return "$rc"
+    _caw_mark_opened "$key"
+    if [[ "${CLAUDE_AUTO_WINDOW_VERIFY:-1}" == 1 ]]; then
+      local vd="${CLAUDE_AUTO_WINDOW_VERIFY_DELAY_SECONDS:-3}"
+      [[ "$vd" == <-> ]] && (( vd > 0 )) && sleep "$vd"
+      if json="$(_caw_cp_usage_json "$account")" && _caw_session_from_json "$key" "$json" "$label"; then
+        _caw_log INFO "[$account] five-hour window confirmed open"
+      else
+        _caw_log INFO "[$account] anchor completed (window opened); endpoint hasn't reflected it yet — treating as success"
+      fi
+    fi
+    return 0
+  } always {
+    _caw_release_lock "$lock"
+  }
+}
+
+# Immediate per-account anchor (mirror of _caw_run_one). Dispatched from
+# _caw_run_one when an account is pinned.
+_caw_run_account() {
+  emulate -L zsh
+  local dir account key rc verify="${CLAUDE_AUTO_WINDOW_VERIFY:-1}"
+  dir="$(_caw_check_dir)"; account="${CLAUDE_AUTO_WINDOW_CP_ACCOUNT}"
+  key="$(_caw_account_key "$dir" "$account")"
+  local label="account:${account}"
+  local lock; lock="$(_caw_acquire_lock "$key")"; rc=$?
+  (( rc == 75 )) && { _caw_log WARN "another claude-auto-window is running for account $account"; return 75; }
+  (( rc != 0 )) && return "$rc"
+  {
+    # The only --run guard: refuse only on the definitive no-5h-window signal.
+    if [[ "${CLAUDE_AUTO_WINDOW_FORCE:-0}" != 1 ]]; then
+      local gj; gj="$(_caw_cp_usage_json "$account")"
+      if [[ -n "$gj" ]]; then
+        _caw_session_from_json "$key" "$gj" "$label"; local sc=$?
+        (( sc == 2 )) && { _caw_log WARN "account $account has no 5-hour window — refusing (use --force)"; return 70; }
+      fi
+    fi
+    _caw_log INFO "[$account] run mode: anchoring one window (no checks, no jitter)"
+    _caw_cp_anchor "$account"; rc=$?
+    (( rc == 5 )) && { _caw_open_window "$dir" 1; rc=$?; }
+    (( rc == 0 )) || return "$rc"
+    _caw_mark_opened "$key"
+    if (( verify )); then
+      local vj; if vj="$(_caw_cp_usage_json "$account")" && _caw_session_from_json "$key" "$vj" "$label"; then
+        _caw_log INFO "[$account] five-hour window confirmed open"
+      else
+        _caw_log INFO "[$account] anchor completed; endpoint lag — treating as success"
+      fi
+    fi
+  } always {
+    _caw_release_lock "$lock"
+  }
+}
+
+# Per-account status line (mirror of _caw_status_line). Dispatched from
+# _caw_status_one when an account is pinned.
+_caw_status_account() {
+  emulate -L zsh
+  local dir account key json rc sc open session pct reset
+  dir="$(_caw_check_dir)"; account="${CLAUDE_AUTO_WINDOW_CP_ACCOUNT}"
+  key="$(_caw_account_key "$dir" "$account")"
+  json="$(_caw_cp_usage_json "$account")"; rc=$?
+  if (( rc != 0 )) || [[ -z "$json" ]]; then
+    print -r -- "account=$account (dir=$dir) five_hour=? (claude-profile usage unavailable — token lapsed / offline?)"
+    return 0
+  fi
+  _caw_session_from_json "$key" "$json" "account:$account"; sc=$?
+  if (( sc == 2 )); then
+    print -r -- "account=$account (dir=$dir) five_hour=n/a (no session window)"
+    return 0
+  fi
+  (( sc == 0 )) && open=yes || open=no
+  session="$(jq -c 'first(.limits[]? | select(.kind=="session")) // {}' <<< "$json" 2>/dev/null)"
+  pct="$(jq -r '.percent // 0'       <<< "$session")"
+  reset="$(jq -r '.resets_at // "?"' <<< "$session")"
+  print -r -- "account=$account (dir=$dir) five_hour_open=$open percent=$pct resets_at=$reset"
+  local model="${CLAUDE_AUTO_WINDOW_MODEL-haiku}" wpct verdict
+  wpct="$(jq -r 'first(.limits[]? | select(.kind=="weekly_all")) | .percent // "?"' <<< "$json" 2>/dev/null)"
+  if _caw_plan_exhausted "$json" "$model"; then
+    verdict="WOULD SKIP — starter model '${model:-<account default>}' off-plan"
+  else
+    verdict="would fire — starter model '${model:-<account default>}' on plan"
+  fi
+  print -r -- "  weekly_all=${wpct}%  →  $verdict"
+  local ssr; ssr="$(_caw_state_get "$key" resets_at 2>/dev/null)"
+  [[ -n "$ssr" && "$ssr" != "$reset" ]] && print -r -- "  daemon-stored resets_at=$ssr"
+  if _caw_breaker_tripped "$key"; then
+    print -r -- "  ⚠ DISABLED (sentinel present): $(_caw_state_file "$key" tripped)"
+    print -r -- "    reason: $(_caw_breaker_reason "$key")"
+    print -r -- "    re-enable: claude-auto-window --reset"
+  fi
+}
+
+# Per-account breaker reset (mirror of _caw_reset_one).
+_caw_reset_account() {
+  emulate -L zsh
+  local dir account key
+  dir="$(_caw_check_dir)"; account="${CLAUDE_AUTO_WINDOW_CP_ACCOUNT}"
+  key="$(_caw_account_key "$dir" "$account")"
+  _caw_breaker_clear "$key"
+  _caw_log INFO "Circuit breaker cleared for account $account — will resume on the next run"
+}
+
+# ============================================================================
 # Public entry points
 # ============================================================================
 
@@ -840,6 +1325,7 @@ _caw_verify_started() {
 # Single-profile body; the public claude-auto-window-run iterates it.
 _caw_run_one() {
   emulate -L zsh
+  [[ -n "${CLAUDE_AUTO_WINDOW_CP_ACCOUNT:-}" ]] && { _caw_run_account; return $?; }
   local dir lock rc verify="${CLAUDE_AUTO_WINDOW_VERIFY:-1}"
   dir="$(_caw_check_dir)"
   lock="$(_caw_acquire_lock "$dir")"; rc=$?
@@ -871,6 +1357,7 @@ _caw_run_one() {
 # the daemon) iterate it across profiles.
 _caw_once_one() {
   emulate -L zsh
+  [[ -n "${CLAUDE_AUTO_WINDOW_CP_ACCOUNT:-}" ]] && { _caw_once_account; return $?; }
   local dir lock rc
   local jitter_max="${CLAUDE_AUTO_WINDOW_JITTER_MAX_SECONDS:-180}"
   local jitter_min="${CLAUDE_AUTO_WINDOW_JITTER_MIN_SECONDS:-0}"
@@ -1114,6 +1601,7 @@ claude-auto-window-daemon() {
 # Single-profile status line; the public claude-auto-window-status iterates it.
 _caw_status_one() {
   emulate -L zsh
+  [[ -n "${CLAUDE_AUTO_WINDOW_CP_ACCOUNT:-}" ]] && { _caw_status_account; return $?; }
   _caw_status_line "$(_caw_check_dir)"
 }
 
@@ -1155,12 +1643,18 @@ claude-auto-window-reset()  { emulate -L zsh; _caw_iterate _caw_reset_one; }
 _caw_profile_spec() {
   emulate -L zsh
   local name="$1"
+  # Prefer claude-profile's OWN config for name→dir, so the two tools never
+  # diverge (a claude-profile `personal` → ~/.claude must not be shadowed by a
+  # stale builtin guess). Falls through to the builtin map when claude-profile
+  # isn't active or doesn't define that profile.
+  if [[ -n "$name" && "$name" != default && "$name" != /* ]] && _caw_cp_active; then
+    local cpdir; cpdir="$(jq -r --arg n "$name" '.profiles[$n].dir // empty' "$(_caw_cp_config)" 2>/dev/null)"
+    [[ -n "$cpdir" ]] && { print -r -- "$(_caw_cp_expand "$cpdir")"; return 0; }
+  fi
   case "$name" in
     ""|default)  print -r -- default ;;                     # let Claude resolve ~/.claude
-    personal)    print -r -- "$HOME/.claude-personal" ;;
-    work)        print -r -- "$HOME/.claude" ;;
     /*)          print -r -- "${name%/}" ;;                 # absolute path
-    *)           _caw_log ERROR "unknown --profile '$name' (use default|personal|work|<abs path>)"; return 2 ;;
+    *)           _caw_log ERROR "unknown --profile '$name' (use 'default', an absolute path, or a claude-profile profile name)"; return 2 ;;
   esac
 }
 
@@ -1170,6 +1664,13 @@ _caw_profile_spec() {
 _caw_profile_dir() {
   emulate -L zsh
   local spec="$1"
+  # Account spec `cpacct:<account>:<dir>` → its account pseudo-key (this is the
+  # value the daemon/iterators use for the disable map, breaker, resets_at and
+  # dedup — all keying, never a real path op).
+  if [[ "$spec" == cpacct:* ]]; then
+    local rest="${spec#cpacct:}"
+    _caw_account_key "${rest#*:}" "${rest%%:*}"; return 0
+  fi
   [[ "$spec" == default ]] && { print -r -- "$HOME/.claude"; return 0; }
   print -r -- "${spec%/}"
 }
@@ -1181,6 +1682,15 @@ _caw_profile_dir() {
 _caw_pin_profile() {
   emulate -L zsh
   local spec="$1"
+  # Account spec `cpacct:<account>:<dir>` → pin the dir AND the account, so the
+  # single-profile bodies dispatch to their _account variants.
+  if [[ "$spec" == cpacct:* ]]; then
+    local rest="${spec#cpacct:}"
+    typeset -gx CLAUDE_AUTO_WINDOW_CONFIG_DIR="${${rest#*:}%/}"
+    typeset -gx CLAUDE_AUTO_WINDOW_CP_ACCOUNT="${rest%%:*}"
+    return 0
+  fi
+  unset CLAUDE_AUTO_WINDOW_CP_ACCOUNT
   if [[ "$spec" == default ]]; then
     unset CLAUDE_AUTO_WINDOW_CONFIG_DIR
   else
@@ -1194,8 +1704,8 @@ _caw_pin_profile() {
 #   3. CLAUDE_AUTO_WINDOW_CONFIG_DIR set (legacy single-profile env) → one spec
 #   4. fallback → a single `default`
 # Then dedup by concrete check dir (first occurrence wins; WARN on the repeat —
-# e.g. `--profile work --profile default` both resolve to ~/.claude). Returns
-# non-zero if any name in CLAUDE_AUTO_WINDOW_PROFILES was unresolvable.
+# e.g. `--profile default --config-dir ~/.claude` both resolve to ~/.claude).
+# Returns non-zero if any name in CLAUDE_AUTO_WINDOW_PROFILES was unresolvable.
 _caw_resolve_profiles() {
   emulate -L zsh
   typeset -ga _caw_profiles
@@ -1211,9 +1721,43 @@ _caw_resolve_profiles() {
     done
   elif [[ -n "${CLAUDE_AUTO_WINDOW_CONFIG_DIR:-}" ]]; then
     out=( "${CLAUDE_AUTO_WINDOW_CONFIG_DIR%/}" )
+  elif _caw_cp_active; then
+    # No explicit selection + claude-profile active → seed one spec per configured
+    # profile dir (a dir==~/.claude becomes the `default` passthrough). The
+    # expansion below turns account-ful profiles into per-account targets and
+    # leaves single-login (account-less) profiles as plain dir-targets — so both
+    # serial and multi-profile setups are covered.
+    local pdir got=0
+    while IFS= read -r pdir; do
+      [[ -z "$pdir" ]] && continue
+      if [[ "${pdir%/}" == "$HOME/.claude" ]]; then out+=( default ); else out+=( "${pdir%/}" ); fi
+      got=1
+    done < <(_caw_cp_profile_dirs)
+    (( got )) || out=( default )
   else
     out=( default )
   fi
+
+  # Expand any dir-spec that is a claude-profile profile WITH accounts into one
+  # account-spec per account, so an explicitly-selected serial profile (or the
+  # default ~/.claude when it's serial) keeps ALL its subscriptions open. A
+  # dir-spec with no matching claude-profile accounts stays a plain dir-target
+  # (traditional single-window behavior).
+  if _caw_cp_active; then
+    local -a exp accts; local s acct real
+    for s in "${out[@]}"; do
+      if [[ "$s" == cpacct:* ]]; then exp+=( "$s" ); continue; fi
+      real="$(_caw_profile_dir "$s")"                     # default→~/.claude, dir→dir
+      accts=( ${(f)"$(_caw_cp_accounts_for_dir "$real")"} )
+      if (( ${#accts} )); then
+        for acct in "${accts[@]}"; do exp+=( "cpacct:${acct}:${real%/}" ); done
+      else
+        exp+=( "$s" )
+      fi
+    done
+    out=( "${exp[@]}" )
+  fi
+
   local -A seen
   _caw_profiles=()
   for sp in "${out[@]}"; do
@@ -1230,7 +1774,16 @@ _caw_resolve_profiles() {
 
 _caw_usage_text() {
   cat <<'USAGE'
-claude-auto-window — keep a Claude five-hour window perpetually open (tmux-driven)
+claude-auto-window — keep a Claude five-hour window perpetually open
+
+Two opener strategies (--opener, default http):
+  http   Anchor the window with ONE raw POST /v1/messages using the OAuth token
+         Claude Code already stored — no tmux, no claude binary. Lightest path
+         (the default). Falls back to the tmux opener when the token is
+         expired/absent (only a real claude launch can refresh it) or the
+         request is auth-rejected.
+  tmux   Drive a real interactive claude session in a throwaway tmux session.
+         Heaviest but most faithful; self-heals an expired token on its own.
 
 Usage:
   claude-auto-window [--once]            # check window; if closed, jitter + open (default)
@@ -1241,11 +1794,13 @@ Usage:
 
 Profile (repeatable — one daemon/run holds N accounts open):
   --config-dir PATH        Explicit Claude profile dir (pins CLAUDE_CONFIG_DIR)
-  --profile NAME           default | personal | work | <abs path>
-                           (default = let Claude Code resolve ~/.claude)
+  --profile NAME           default | <abs path> | a claude-profile profile name
+                           (default = let Claude Code resolve ~/.claude; other
+                           NAMES resolve from claude-profile's config, defined
+                           per-machine there — not hardcoded here.)
                            Repeat either flag to service several profiles, e.g.
-                           --profile default --profile personal. Or set
-                           CLAUDE_AUTO_WINDOW_PROFILES="personal work" once.
+                           --profile default --profile <name>. Or set
+                           CLAUDE_AUTO_WINDOW_PROFILES="a b" once.
                            Each profile is checked/opened independently with
                            per-profile failure isolation; --status prints one
                            block per profile (with the balance-gate verdict).
@@ -1268,10 +1823,23 @@ $XDG_CONFIG_HOME/claude-auto-window/config):
   --expect TEXT            Reply token to look for.            Default: "OK."
   --expect-count N         Reply occurrences required, after the prompt-echo
                            lines are filtered out.             Default: 1
-  --model MODEL            Model alias or id. Default: haiku (cheapest tier,
-                           alias tracks the latest version). "" = account
-                           default. Falls back to the account default if the
-                           chosen model has been retired.
+  --model MODEL            Model alias or id for the tmux opener. Default: haiku
+                           (cheapest tier, alias tracks the latest version).
+                           "" = account default. Falls back to the account
+                           default if the chosen model has been retired.
+  --opener STRATEGY        Window opener: http | tmux.            Default: http
+                           http = one raw POST /v1/messages (no tmux/binary),
+                           falling back to tmux when the token needs refreshing.
+  --http-model ID          CONCRETE model id for the http opener (the CLI's
+                           "haiku" alias is not valid on the API).
+                                                  Default: claude-haiku-4-5-20251001
+  --claude-profile MODE    claude-profile integration: auto | on | off.
+                           auto (default) = keep EVERY serial subscription's
+                           window open when claude-profile's config + script are
+                           found (parked accounts included — http only). on =
+                           require it (warn if missing). off = ignore it (pure
+                           single-window / traditional behavior).
+  --claude-profile-py PATH Path to claude-profile.py (auto-discovered if unset).
   --starter-dir PATH       Working dir for the starter (isolated from the work
                            cwd). Default: $TMPDIR/claude-auto-window-<uid>.
   --claude-bin PATH        Absolute path to the claude executable.
@@ -1358,6 +1926,14 @@ _caw_main() {
       --expect-count=*)  typeset -gx CLAUDE_AUTO_WINDOW_EXPECT_COUNT="${1#*=}" ;;
       --model)           typeset -gx CLAUDE_AUTO_WINDOW_MODEL="$2"; shift ;;
       --model=*)         typeset -gx CLAUDE_AUTO_WINDOW_MODEL="${1#*=}" ;;
+      --opener)          typeset -gx CLAUDE_AUTO_WINDOW_OPENER="$2"; shift ;;
+      --opener=*)        typeset -gx CLAUDE_AUTO_WINDOW_OPENER="${1#*=}" ;;
+      --http-model)      typeset -gx CLAUDE_AUTO_WINDOW_HTTP_MODEL="$2"; shift ;;
+      --http-model=*)    typeset -gx CLAUDE_AUTO_WINDOW_HTTP_MODEL="${1#*=}" ;;
+      --claude-profile)     typeset -gx CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE="$2"; shift ;;
+      --claude-profile=*)   typeset -gx CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE="${1#*=}" ;;
+      --claude-profile-py)   typeset -gx CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE_PY="$2"; shift ;;
+      --claude-profile-py=*) typeset -gx CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE_PY="${1#*=}" ;;
       --starter-dir)     typeset -gx CLAUDE_AUTO_WINDOW_STARTER_DIR="$2"; shift ;;
       --starter-dir=*)   typeset -gx CLAUDE_AUTO_WINDOW_STARTER_DIR="${1#*=}" ;;
       --claude-bin)      typeset -gx CLAUDE_AUTO_WINDOW_CLAUDE_BIN="$2"; shift ;;
@@ -1376,6 +1952,17 @@ _caw_main() {
 
   # Profiles are resolved (env/config fallback + dedup) lazily by the iterator
   # wrappers and the daemon — CLI-appended specs above take precedence there.
+
+  # Validate the opener strategy up front so a bad value fails fast (rather than
+  # only at fire time, which for a daemon would repeat every cycle).
+  case "${CLAUDE_AUTO_WINDOW_OPENER:-http}" in
+    tmux|http) ;;
+    *) print -u2 "claude-auto-window: --opener must be 'tmux' or 'http' (got: ${CLAUDE_AUTO_WINDOW_OPENER})"; return 2 ;;
+  esac
+  case "${CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE:-auto}" in
+    auto|on|off) ;;
+    *) print -u2 "claude-auto-window: --claude-profile must be 'auto', 'on', or 'off' (got: ${CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE})"; return 2 ;;
+  esac
 
   case "$mode" in
     run)    claude-auto-window-run ;;

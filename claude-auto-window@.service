@@ -2,8 +2,8 @@
 #
 # Template: the instance name (%i) is the profile to keep a window open for.
 #   default  → let Claude Code resolve ~/.claude (no CLAUDE_CONFIG_DIR)
-#   personal → ~/.claude-personal
-#   work     → ~/.claude
+#   <name>   → a claude-profile profile name (resolved from its per-machine
+#              config.json — e.g. work/personal, if you configure them there)
 #   or an absolute path to any Claude profile dir
 #
 # Install (Linux, systemd --user):
@@ -21,6 +21,12 @@
 # work" in the EnvironmentFile and drop the "--profile %i" from ExecStart (it
 # would otherwise pin just that one). N side-by-side instances remain the tidier
 # systemd idiom; the single-unit form is the macOS-parity option.
+#
+# claude-profile integration: if claude-profile is installed and %i's config dir
+# holds several subscriptions ("accounts"), --profile %i AUTO-EXPANDS to keep
+# every account's window open (parked ones via HTTP) — no unit change needed. On
+# a host without claude-profile it's a no-op (plain single-window behavior). Put
+# CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE=off in the EnvironmentFile to force it off.
 #
 # Headless server (no persistent login session): enable lingering so the --user
 # manager runs at boot without anyone logged in:
