@@ -31,6 +31,7 @@ differ only in transport.
 | `claude-auto-window@.service` | systemd `--user` template (Linux daemon), keyed on profile via `%i`. |
 | `claude-auto-window.plist` | launchd template (macOS daemon), `__HOME__` placeholders. |
 | `README.md` | User-facing docs. Keep in sync when flags, defaults or behaviour change. |
+| `tools/generate-readme-svg.zsh` | Regenerates `assets/*.svg`. Runs the REAL script in a sandbox (stub `curl`/`security`/claude-profile) and renders its captured output; the timeline is hand-authored. Re-run after any `--status` format or color change. |
 
 ## Architecture (control flow)
 
@@ -275,6 +276,25 @@ that profile for the daemon's lifetime; **3** ⇒ disable until the sentinel cle
 (re-checked each wake); **2** is still fatal (config/usage-parse); **75** (locked)
 and transient errors just skip that profile this wake. The daemon's own process
 exit is **0** once all profiles are disabled.
+
+## README images
+
+`assets/*.svg` are generated — never hand-edit them. Two are **captures**: the
+generator runs `--status` unmodified against a stub `curl` serving canned usage
+JSON, with `CLAUDE_AUTO_WINDOW_COLOR=always` (TTY detection would strip color
+through the capture pipe). So the text in those images is the script's own
+output, and it drifts the moment the line format or palette changes — re-run the
+generator, don't patch the SVG. The only edit made to captured text is rewriting
+the mktemp sandbox path to `/home/demo`.
+
+The third, `timeline`, is a **schematic** of the daemon's sleep/fire cycle, drawn
+by hand because there is no output to photograph. It animates via CSS keyframes
+(an SVG in an `<img>` has scripting disabled but declarative animation live), and
+every animated element's BASE state is the fire-moment frame, so
+`prefers-reduced-motion` freezes it somewhere legible rather than blank.
+
+Filenames carry a random hash purely to bust GitHub's camo cache; the generator
+rewrites the README refs and deletes superseded files.
 
 ## Testing without spending real tokens
 

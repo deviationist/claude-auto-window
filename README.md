@@ -5,6 +5,10 @@ there's no cold-start wait the moment you actually want to use Claude. When the
 current window has lapsed, it opens a fresh one with a single trivial request.
 That one request anchors a new 5-hour window at minimal token cost.
 
+<p align="center">
+  <img src="assets/status-387820.svg" alt="A terminal showing claude-auto-window --status: the five-hour window is open at 34 percent with its reset time, the balance gate reports it would fire a starter on the haiku model, and no usage credits have been spent">
+</p>
+
 There are **two opener strategies** (`--opener`):
 
 - **`http`** (default) — replicate the request Claude Code itself sends: **one raw
@@ -162,6 +166,10 @@ resolved from claude-profile's own config, so the two tools never disagree).
   falls back to a `tmux` launch in the dir (which refreshes it and anchors). Parked
   accounts have no such fallback — an aged-out parked refresh token needs
   `claude-profile auth <account>`.
+
+<p align="center">
+  <img src="assets/accounts-387820.svg" alt="claude-auto-window --status across two subscriptions in one config dir: max20x has an open window and would fire, while max5x has a closed window but a spent weekly allowance, so the balance gate reports WOULD SKIP instead of burning usage credits">
+</p>
 
 ```sh
 # Keep BOTH subscriptions' windows open (parked one included), no rotation:
@@ -417,6 +425,10 @@ State lives in `$CLAUDE_AUTO_WINDOW_STATE_DIR` (default
 
 ## The daemon doesn't poll continuously
 
+<p align="center">
+  <img src="assets/timeline-387820.svg" alt="A timeline of two consecutive five-hour windows: the first fills while the daemon sleeps rather than polling, then just after it expires the daemon wakes, checks, fires one starter, and the second window opens — about two requests per window">
+</p>
+
 When a window is open, the daemon knows exactly when it ends (`resets_at`), so it
 **sleeps until just after it expires** (`resets_at + --post-expiry`, default 5 s),
 wakes, sees it closed, and fires the next starter — no polling in between. It only
@@ -602,7 +614,29 @@ claude-auto-window-once
 | `claude-auto-window@.service` | systemd `--user` template (per-profile). |
 | `claude-auto-window.plist` | macOS launchd template. |
 | `claude-auto-window.env.example` | All env overrides, documented. |
+| `tools/generate-readme-svg.zsh` | Regenerates the README images (see below). |
+| `assets/*.svg` | The README images. Generated — don't hand-edit. |
 | `AGENTS.md` | Orientation for AI agents working in this repo. |
+
+## Regenerating the README images
+
+The two terminal shots are **real output**, not mockups: the generator builds a
+hermetic sandbox (fake `$HOME`, a stub `curl` standing in for the usage endpoint,
+a stub `security` so the Keychain is never touched, and a stub claude-profile for
+the multi-account shot) and runs this script's own `--status` unmodified with
+`CLAUDE_AUTO_WINDOW_COLOR=always`. Only the window chrome is drawn. The timeline
+is a schematic — there's no output to photograph when the subject is five hours
+passing — and is animated with CSS keyframes, frozen by `prefers-reduced-motion`
+on a frame that still tells the whole story.
+
+```sh
+zsh tools/generate-readme-svg.zsh          # → assets/*.svg + README refs, commit all
+zsh tools/generate-readme-svg.zsh OUTDIR   # → fixed names elsewhere, README untouched
+```
+
+Regenerate whenever the `--status` line format, the colors, or the demo values
+change. The hash in each filename busts GitHub's camo image cache; the generator
+rewrites the README's `<img>` refs and deletes the superseded files itself.
 
 ## License
 

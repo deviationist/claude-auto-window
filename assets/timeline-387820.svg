@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="276" viewBox="0 0 880 276" role="img" aria-label="A timeline of two consecutive five-hour windows. The first window fills, and while it is open the daemon sleeps rather than polling. Just after it expires the daemon wakes, checks the usage endpoint, fires one starter, and a second window opens and begins filling. Two requests are spent per window.">
+<defs><style>
+    .lbl{font-family:'Cascadia Code','Fira Code',SFMono-Regular,Consolas,Menlo,monospace;font-size:11px;fill:#9399b2}
+    .txt{font-family:'Cascadia Code','Fira Code',SFMono-Regular,Consolas,Menlo,monospace;font-size:11px;fill:#cdd6f4}
+    .ttl{font-family:'Cascadia Code','Fira Code',SFMono-Regular,Consolas,Menlo,monospace;font-size:13px;fill:#cdd6f4;font-weight:bold}
+    .sub{font-family:'Cascadia Code','Fira Code',SFMono-Regular,Consolas,Menlo,monospace;font-size:11px;fill:#9399b2}
+    .fill{transform-box:fill-box;transform-origin:left center}
+    /* Base state = the instant the starter fires: window 1 full, window 2 just
+       starting, playhead and the fire pulse parked at the boundary. */
+    .w1{transform:scaleX(1)}
+    .w2{transform:scaleX(0)}
+    .head{transform:translateX(340px)}
+    @keyframes w1{0%{transform:scaleX(0)}50%{transform:scaleX(1)}100%{transform:scaleX(1)}}
+    @keyframes w2{0%,50%{transform:scaleX(0)}100%{transform:scaleX(1)}}
+    @keyframes head{0%{transform:translateX(0)}100%{transform:translateX(680px)}}
+    @keyframes pulse{0%,44%{opacity:0}48%,56%{opacity:1}62%,100%{opacity:0}}
+    @keyframes sleep1{0%{opacity:1}48%{opacity:1}52%,100%{opacity:.25}}
+    @keyframes sleep2{0%,48%{opacity:.25}52%{opacity:1}100%{opacity:1}}
+    @media (prefers-reduced-motion: no-preference){
+      .w1{animation:w1 12s linear infinite}
+      .w2{animation:w2 12s linear infinite}
+      .head{animation:head 12s linear infinite}
+      .pulse{animation:pulse 12s linear infinite}
+      .s1{animation:sleep1 12s linear infinite}
+      .s2{animation:sleep2 12s linear infinite}
+    }
+  </style></defs>
+  <rect width="880" height="276" rx="10" fill="#1e1e2e"/>
+  <text x="20" y="30" class="ttl">claude-auto-window --daemon</text>
+  <text x="20" y="48" class="sub">windows roll back to back — and the daemon sleeps through each one instead of polling it</text>
+  <text x="156" y="95" class="lbl" text-anchor="end">5-hour window</text>
+  <text x="156" y="148" class="lbl" text-anchor="end">daemon</text>
+  <text x="156" y="190"  class="lbl" text-anchor="end">spend</text>
+  <rect x="170" y="78" width="340" height="26" rx="5" fill="#313244"/>
+  <rect x="170" y="78" width="340" height="26" rx="5" fill="#a6e3a1" opacity="0.30" class="fill w1"/>
+  <text x="340" y="95" class="txt" text-anchor="middle">window 1</text>
+  <rect x="510" y="78" width="340" height="26" rx="5" fill="#313244"/>
+  <rect x="510" y="78" width="340" height="26" rx="5" fill="#a6e3a1" opacity="0.30" class="fill w2"/>
+  <text x="680" y="95" class="txt" text-anchor="middle">window 2</text>
+  <rect x="170" y="134" width="334" height="20" rx="4" fill="#89b4fa" opacity="0.16" class="s1"/>
+  <text x="340" y="148" class="lbl" text-anchor="middle">asleep until resets_at</text>
+  <rect x="516" y="134" width="334" height="20" rx="4" fill="#89b4fa" opacity="0.16" class="s2"/>
+  <text x="680" y="148" class="lbl" text-anchor="middle">asleep until resets_at</text>
+  <rect x="508" y="130" width="4" height="28" rx="2" fill="#f9e2af"/>
+  <g class="pulse">
+    <circle cx="510" cy="186" r="5" fill="#f9e2af"/>
+    <text x="522" y="190" class="txt" fill="#f9e2af">wake · check · fire one starter</text>
+  </g>
+  <circle cx="184" cy="186" r="4" fill="#cba6f7"/>
+  <text x="196" y="190" class="lbl">confirm the new window</text>
+  <line x1="170" y1="216" x2="850" y2="216" stroke="#45475a" stroke-width="1"/>
+  <line x1="170" y1="216" x2="170" y2="221" stroke="#45475a"/>
+  <text x="170" y="234" class="lbl" text-anchor="middle">0h</text>
+  <line x1="510" y1="216" x2="510" y2="221" stroke="#45475a"/>
+  <text x="510" y="234" class="lbl" text-anchor="middle">5h</text>
+  <line x1="850" y1="216" x2="850" y2="221" stroke="#45475a"/>
+  <text x="850" y="234" class="lbl" text-anchor="middle">10h</text>
+  <text x="20" y="262" class="sub">≈2 requests per 5-hour window — one to confirm it opened, one at expiry. Nothing in between.</text>
+  <g class="head">
+    <line x1="170" y1="70" x2="170" y2="218" stroke="#cdd6f4" stroke-width="1.5" opacity="0.85"/>
+    <circle cx="170" cy="66" r="3.5" fill="#cdd6f4"/>
+  </g>
+</svg>
