@@ -218,6 +218,15 @@ functions are the `claude-auto-window*` names.
   governs). Don't widen it back to "any weekly cap at 100%" — a maxed Fable cap
   must not suppress a plan-covered haiku starter. The skip is a clean rc 0, not an
   error.
+- **Only `--status` is colorized; `_caw_log` never is.** Log output goes to
+  journald, cron mail and `--log` files, where escape codes are corruption rather
+  than decoration. Color lives in `_caw_status_line` / `_caw_status_account`,
+  initialised once by `_caw_color_init` from `_caw_status_one`, and gated on
+  `CLAUDE_AUTO_WINDOW_COLOR` (`auto` = stdout is a TTY | `always` | `never`) with
+  `NO_COLOR` overriding everything. `always` exists because the README-SVG
+  generator captures output through a pipe. **Keep the plain-text line shape
+  byte-identical** — only escapes are added, never re-ordered or re-worded
+  fields, since `--status` is plausibly grepped in user scripts.
 - **Teardown is unconditional.** `kill-session` by unique name + transcript
   cleanup run in the `always {}` block regardless of success/timeout.
 - **Isolated tmux socket** (`-L claude-auto-window`) — never touch the user's real

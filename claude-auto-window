@@ -86,6 +86,40 @@ _caw_log() {
   [[ -n "${CLAUDE_AUTO_WINDOW_LOG:-}" ]] && print -r -- "$line" >> "$CLAUDE_AUTO_WINDOW_LOG"
 }
 
+# ----------------------------------------------------------------------------
+# Color — for the human-facing `--status` output ONLY.
+#
+# _caw_log output is deliberately NEVER colored: it goes to journald, cron mail
+# and --log files, where escape codes are corruption rather than decoration.
+#
+# CLAUDE_AUTO_WINDOW_COLOR: auto (default) = color only when stdout is a TTY;
+# always/1 = color even through a pipe (what the README-SVG generator needs,
+# since it captures output non-interactively); never/0 = plain. NO_COLOR always
+# wins, whatever its value (https://no-color.org).
+# ----------------------------------------------------------------------------
+typeset -g _caw_c_reset="" _caw_c_bold="" _caw_c_dim="" \
+           _caw_c_red="" _caw_c_green="" _caw_c_yellow=""
+
+_caw_color_init() {
+  emulate -L zsh
+  local mode="${CLAUDE_AUTO_WINDOW_COLOR:-auto}" on=0
+  case "$mode" in
+    1|yes|always) on=1 ;;
+    0|no|never)   on=0 ;;
+    auto|"")      [[ -t 1 ]] && on=1 ;;
+    *)            _caw_log WARN "CLAUDE_AUTO_WINDOW_COLOR must be auto|always|never (got: $mode); assuming auto"
+                  [[ -t 1 ]] && on=1 ;;
+  esac
+  [[ -n "${NO_COLOR+x}" ]] && on=0
+  if (( on )); then
+    _caw_c_reset=$'\e[0m'; _caw_c_bold=$'\e[1m';  _caw_c_dim=$'\e[2m'
+    _caw_c_red=$'\e[31m';  _caw_c_green=$'\e[32m'; _caw_c_yellow=$'\e[33m'
+  else
+    _caw_c_reset=""; _caw_c_bold="";  _caw_c_dim=""
+    _caw_c_red="";   _caw_c_green=""; _caw_c_yellow=""
+  fi
+}
+
 _caw_validate_uint() {
   emulate -L zsh
   local name="$1" value="$2"
@@ -266,10 +300,10 @@ _caw_status_line() {
   if (( rc == 3 )); then
     _caw_log ERROR "usage lookup failed for $dir"; return 1
   elif (( rc == 4 )); then
-    print -r -- "profile=$dir five_hour=? (access token expired — --once/the daemon self-heal it with a bare claude launch; any claude use also refreshes it)"
+    print -r -- "profile=${_caw_c_bold}${dir}${_caw_c_reset} five_hour=${_caw_c_yellow}?${_caw_c_reset} ${_caw_c_dim}(access token expired — --once/the daemon self-heal it with a bare claude launch; any claude use also refreshes it)${_caw_c_reset}"
     return 0
   elif (( rc == 2 )); then
-    print -r -- "profile=$dir five_hour=n/a (no session window — API/usage-billed account?)"
+    print -r -- "profile=${_caw_c_bold}${dir}${_caw_c_reset} five_hour=${_caw_c_yellow}n/a${_caw_c_reset} ${_caw_c_dim}(no session window — API/usage-billed account?)${_caw_c_reset}"
     return 0
   fi
   (( rc == 0 )) && open=yes || open=no
@@ -277,7 +311,8 @@ _caw_status_line() {
   session="$(jq -c 'first(.limits[]? | select(.kind=="session")) // {}' <<< "$json" 2>/dev/null)"
   pct="$(jq -r '.percent // 0'       <<< "$session")"
   reset="$(jq -r '.resets_at // "?"' <<< "$session")"
-  print -r -- "profile=$dir five_hour_open=$open percent=$pct resets_at=$reset"
+  local c_open; [[ "$open" == yes ]] && c_open="$_caw_c_green" || c_open="$_caw_c_yellow"
+  print -r -- "profile=${_caw_c_bold}${dir}${_caw_c_reset} five_hour_open=${c_open}${open}${_caw_c_reset} percent=$pct resets_at=${_caw_c_dim}${reset}${_caw_c_reset}"
 
   # Balance-gate view — what the daemon will ACTUALLY do next, and why. The
   # starter's own model decides which weekly bucket governs it (see
@@ -286,9 +321,9 @@ _caw_status_line() {
   local model="${CLAUDE_AUTO_WINDOW_MODEL-haiku}" wpct verdict
   wpct="$(jq -r 'first(.limits[]? | select(.kind=="weekly_all")) | .percent // "?"' <<< "$json" 2>/dev/null)"
   if _caw_plan_exhausted "$json" "$model"; then
-    verdict="WOULD SKIP — starter model '${model:-<account default>}' is off-plan (credit-billed / refused)"
+    verdict="${_caw_c_yellow}WOULD SKIP${_caw_c_reset} — starter model '${model:-<account default>}' is off-plan (credit-billed / refused)"
   else
-    verdict="would fire — starter model '${model:-<account default>}' still on plan"
+    verdict="${_caw_c_green}would fire${_caw_c_reset} — starter model '${model:-<account default>}' still on plan"
   fi
   print -r -- "  weekly_all=${wpct}%  →  $verdict"
 
@@ -303,17 +338,17 @@ _caw_status_line() {
         ((($e.monthly_limit // 0)/$d*100)|round/100) as $lim  |
         "  credits=\($used)/\($lim) \($e.currency // "") used (\(($e.utilization // 0)|floor)%) — spent only after plan is exhausted"
       else empty end' <<< "$json" 2>/dev/null)"
-  [[ -n "$credit_line" ]] && print -r -- "$credit_line"
+  [[ -n "$credit_line" ]] && print -r -- "${_caw_c_dim}${credit_line}${_caw_c_reset}"
 
   # Daemon's own source of truth: the stored resets_at it sleeps against (can lag
   # the live endpoint by a few minutes right after a fresh open).
   local ssr; ssr="$(_caw_state_get "$dir" resets_at 2>/dev/null)"
-  [[ -n "$ssr" && "$ssr" != "$reset" ]] && print -r -- "  daemon-stored resets_at=$ssr"
+  [[ -n "$ssr" && "$ssr" != "$reset" ]] && print -r -- "${_caw_c_dim}  daemon-stored resets_at=$ssr${_caw_c_reset}"
 
   if _caw_breaker_tripped "$dir"; then
-    print -r -- "  ⚠ DISABLED (sentinel present): $(_caw_state_file "$dir" tripped)"
-    print -r -- "    reason: $(_caw_breaker_reason "$dir")"
-    print -r -- "    re-enable: claude-auto-window --reset"
+    print -r -- "  ${_caw_c_red}${_caw_c_bold}⚠ DISABLED (sentinel present):${_caw_c_reset} $(_caw_state_file "$dir" tripped)"
+    print -r -- "${_caw_c_dim}    reason: $(_caw_breaker_reason "$dir")${_caw_c_reset}"
+    print -r -- "${_caw_c_dim}    re-enable: claude-auto-window --reset${_caw_c_reset}"
   fi
 }
 
@@ -1278,33 +1313,34 @@ _caw_status_account() {
   key="$(_caw_account_key "$dir" "$account")"
   json="$(_caw_cp_usage_json "$account")"; rc=$?
   if (( rc != 0 )) || [[ -z "$json" ]]; then
-    print -r -- "account=$account (dir=$dir) five_hour=? (claude-profile usage unavailable — token lapsed / offline?)"
+    print -r -- "account=${_caw_c_bold}${account}${_caw_c_reset} ${_caw_c_dim}(dir=$dir)${_caw_c_reset} five_hour=${_caw_c_yellow}?${_caw_c_reset} ${_caw_c_dim}(claude-profile usage unavailable — token lapsed / offline?)${_caw_c_reset}"
     return 0
   fi
   _caw_session_from_json "$key" "$json" "account:$account"; sc=$?
   if (( sc == 2 )); then
-    print -r -- "account=$account (dir=$dir) five_hour=n/a (no session window)"
+    print -r -- "account=${_caw_c_bold}${account}${_caw_c_reset} ${_caw_c_dim}(dir=$dir)${_caw_c_reset} five_hour=${_caw_c_yellow}n/a${_caw_c_reset} ${_caw_c_dim}(no session window)${_caw_c_reset}"
     return 0
   fi
   (( sc == 0 )) && open=yes || open=no
   session="$(jq -c 'first(.limits[]? | select(.kind=="session")) // {}' <<< "$json" 2>/dev/null)"
   pct="$(jq -r '.percent // 0'       <<< "$session")"
   reset="$(jq -r '.resets_at // "?"' <<< "$session")"
-  print -r -- "account=$account (dir=$dir) five_hour_open=$open percent=$pct resets_at=$reset"
+  local c_open; [[ "$open" == yes ]] && c_open="$_caw_c_green" || c_open="$_caw_c_yellow"
+  print -r -- "account=${_caw_c_bold}${account}${_caw_c_reset} ${_caw_c_dim}(dir=$dir)${_caw_c_reset} five_hour_open=${c_open}${open}${_caw_c_reset} percent=$pct resets_at=${_caw_c_dim}${reset}${_caw_c_reset}"
   local model="${CLAUDE_AUTO_WINDOW_MODEL-haiku}" wpct verdict
   wpct="$(jq -r 'first(.limits[]? | select(.kind=="weekly_all")) | .percent // "?"' <<< "$json" 2>/dev/null)"
   if _caw_plan_exhausted "$json" "$model"; then
-    verdict="WOULD SKIP — starter model '${model:-<account default>}' off-plan"
+    verdict="${_caw_c_yellow}WOULD SKIP${_caw_c_reset} — starter model '${model:-<account default>}' off-plan"
   else
-    verdict="would fire — starter model '${model:-<account default>}' on plan"
+    verdict="${_caw_c_green}would fire${_caw_c_reset} — starter model '${model:-<account default>}' on plan"
   fi
   print -r -- "  weekly_all=${wpct}%  →  $verdict"
   local ssr; ssr="$(_caw_state_get "$key" resets_at 2>/dev/null)"
-  [[ -n "$ssr" && "$ssr" != "$reset" ]] && print -r -- "  daemon-stored resets_at=$ssr"
+  [[ -n "$ssr" && "$ssr" != "$reset" ]] && print -r -- "${_caw_c_dim}  daemon-stored resets_at=$ssr${_caw_c_reset}"
   if _caw_breaker_tripped "$key"; then
-    print -r -- "  ⚠ DISABLED (sentinel present): $(_caw_state_file "$key" tripped)"
-    print -r -- "    reason: $(_caw_breaker_reason "$key")"
-    print -r -- "    re-enable: claude-auto-window --reset"
+    print -r -- "  ${_caw_c_red}${_caw_c_bold}⚠ DISABLED (sentinel present):${_caw_c_reset} $(_caw_state_file "$key" tripped)"
+    print -r -- "${_caw_c_dim}    reason: $(_caw_breaker_reason "$key")${_caw_c_reset}"
+    print -r -- "${_caw_c_dim}    re-enable: claude-auto-window --reset${_caw_c_reset}"
   fi
 }
 
@@ -1602,6 +1638,7 @@ claude-auto-window-daemon() {
 # Single-profile status line; the public claude-auto-window-status iterates it.
 _caw_status_one() {
   emulate -L zsh
+  _caw_color_init
   [[ -n "${CLAUDE_AUTO_WINDOW_CP_ACCOUNT:-}" ]] && { _caw_status_account; return $?; }
   _caw_status_line "$(_caw_check_dir)"
 }
@@ -1845,6 +1882,9 @@ $XDG_CONFIG_HOME/claude-auto-window/config):
                            cwd). Default: $TMPDIR/claude-auto-window-<uid>.
   --claude-bin PATH        Absolute path to the claude executable.
   --tmux-socket NAME       Isolated tmux socket name (-L).     Default: claude-auto-window
+  --color MODE             Colorize --status output: auto | always | never.
+                           auto (default) = only when stdout is a TTY. Log
+                           output is never colorized. NO_COLOR always wins.
   --log PATH               Also append logs here (stdout/stderr always on).
   --no-verify              Skip the post-open window verification.
   --quiet                  Suppress console output (log to --log file only).
@@ -1941,6 +1981,8 @@ _caw_main() {
       --claude-bin=*)    typeset -gx CLAUDE_AUTO_WINDOW_CLAUDE_BIN="${1#*=}" ;;
       --tmux-socket)     typeset -gx CLAUDE_AUTO_WINDOW_TMUX_SOCKET="$2"; shift ;;
       --tmux-socket=*)   typeset -gx CLAUDE_AUTO_WINDOW_TMUX_SOCKET="${1#*=}" ;;
+      --color)           typeset -gx CLAUDE_AUTO_WINDOW_COLOR="$2"; shift ;;
+      --color=*)         typeset -gx CLAUDE_AUTO_WINDOW_COLOR="${1#*=}" ;;
       --log)             typeset -gx CLAUDE_AUTO_WINDOW_LOG="$2"; shift ;;
       --log=*)           typeset -gx CLAUDE_AUTO_WINDOW_LOG="${1#*=}" ;;
       -h|--help)         _caw_usage_text; return 0 ;;
@@ -1963,6 +2005,10 @@ _caw_main() {
   case "${CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE:-auto}" in
     auto|on|off) ;;
     *) print -u2 "claude-auto-window: --claude-profile must be 'auto', 'on', or 'off' (got: ${CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE})"; return 2 ;;
+  esac
+  case "${CLAUDE_AUTO_WINDOW_COLOR:-auto}" in
+    auto|always|never|1|0|yes|no) ;;
+    *) print -u2 "claude-auto-window: --color must be 'auto', 'always' or 'never' (got: ${CLAUDE_AUTO_WINDOW_COLOR})"; return 2 ;;
   esac
 
   case "$mode" in

@@ -241,6 +241,12 @@ claude-auto-window --status     # print current 5h session state
 claude-auto-window --reset      # clear a tripped circuit breaker (see below)
 ```
 
+`--status` colorizes its output when stdout is a terminal — the window state, the
+balance-gate verdict and a tripped breaker each get a color — and falls back to
+plain text when piped or redirected, so it stays greppable. Force either way with
+`--color always` / `--color never`; [`NO_COLOR`](https://no-color.org) always
+wins. Log output is never colorized.
+
 ## Profiles (multi-account)
 
 **One daemon (or one `--once`/`--run`/`--status`/`--reset`) services N profiles.**
@@ -458,6 +464,7 @@ Every flag has a `CLAUDE_AUTO_WINDOW_*` env equivalent (see
 | `--max-failures` | `…_MAX_FAILURES` | 3 | Failed opens before the breaker trips |
 | `--weekly-max-percent` | `…_WEEKLY_MAX_PERCENT` | 100 | Balance gate: stand down at ≥N% of the governing plan bucket |
 | `--profile` / `--config-dir` | `…_PROFILES` / `…_CONFIG_DIR` | `default` | Account(s) to service (repeatable — see *Profiles*) |
+| `--color` | `…_COLOR` | `auto` | Colorize `--status` (`auto` = TTY only; `NO_COLOR` wins) |
 | `--log` | `…_LOG` | — | Opt-in log file |
 
 ## Running it continuously
