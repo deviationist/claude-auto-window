@@ -182,8 +182,9 @@ CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE=off claude-auto-window --status
   stores the OAuth token both openers read).
 - A **Claude Pro/Max** account (see note above).
 - **Optional: [claude-profile](https://github.com/deviationist/claude-profile)**
-  — only if you keep multiple subscriptions in one config dir and want *all*
-  their windows held open. See *claude-profile integration*.
+  (plus **python3**, which it's invoked with) — only if you keep multiple
+  subscriptions in one config dir and want *all* their windows held open. See
+  *claude-profile integration*.
 
 ### Authentication
 
@@ -235,7 +236,7 @@ built in, no other files to install.
 claude-auto-window              # --once: check; if closed, jitter + open (default)
 claude-auto-window --run        # open one now — no window-state checks, no jitter
 claude-auto-window --run --force  # ...and skip even the "no 5h window" safety check
-claude-auto-window --daemon     # loop --once on a fixed interval
+claude-auto-window --daemon     # service every profile, sleeping until the next expiry
 claude-auto-window --status     # print current 5h session state
 claude-auto-window --reset      # clear a tripped circuit breaker (see below)
 ```

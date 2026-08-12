@@ -29,7 +29,8 @@
 # Modes (pick one; --once is the default)
 #   --run          Fire one starter now, no checks, no jitter. ("just do it")
 #   --once         Check the window; only if none is open, jitter then fire.
-#   --daemon       Loop --once at a fixed interval (systemd/launchd target).
+#   --daemon       Service every profile, sleeping until the next window expires
+#                  (systemd/launchd target). Not a fixed-interval poll.
 #   --status       Print the current five-hour session state and exit.
 #
 # Profile (multi-account — one daemon/run services N profiles)
@@ -1788,7 +1789,7 @@ Two opener strategies (--opener, default http):
 Usage:
   claude-auto-window [--once]            # check window; if closed, jitter + open (default)
   claude-auto-window --run               # open one now, no checks, no jitter
-  claude-auto-window --daemon            # loop --once on a fixed interval
+  claude-auto-window --daemon            # keep windows open; sleeps until expiry
   claude-auto-window --status            # print current five-hour session state
   claude-auto-window --reset             # clear a tripped circuit breaker
 
