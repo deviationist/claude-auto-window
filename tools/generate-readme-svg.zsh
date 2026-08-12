@@ -115,6 +115,30 @@ JSON
 
 # ---- capture the real output ----------------------------------------------
 caw="$root/claude-auto-window"
+[[ -x $caw ]] || {
+  print -u2 "generate-readme-svg: no executable script at $caw"
+  print -u2 "  (this file derives the repo root from its own location — run it from the"
+  print -u2 "   repo as 'zsh tools/generate-readme-svg.zsh', not from a copy elsewhere)"
+  exit 1
+}
+
+# A capture that comes back empty must be fatal. The emitter is perfectly happy
+# to lay out zero lines, so without this the run "succeeds" and writes an image
+# of an empty terminal — which is exactly what a wrong $caw produced once, with
+# the reason swallowed by the 2>/dev/null inside capture().
+require_capture() {   # <file> <label>
+  local f=$1 label=$2
+  [[ -s $f ]] || {
+    print -u2 "generate-readme-svg: the $label capture is EMPTY — refusing to write an image of an empty terminal."
+    print -u2 "  Re-run its capture without 2>/dev/null to see what --status said."
+    exit 1
+  }
+  grep -q 'five_hour' "$f" || {
+    print -u2 "generate-readme-svg: the $label capture does not look like --status output:"
+    cat -v "$f" >&2
+    exit 1
+  }
+}
 
 # The ONE edit made to captured text: the sandbox lives under a mktemp path, so
 # the profile dir would render as /private/var/folders/…/T/tmp.XXXX/home/.claude.
@@ -132,6 +156,7 @@ capture() {   # <outfile> <usage-file> [extra args...]
 usage_json 34 9480 22 Fable 71 > "$tmp/usage-open.json"
 rm -rf "$tmp/state/caw"
 capture "$tmp/cap-status.txt" "$tmp/usage-open.json"
+require_capture "$tmp/cap-status.txt" single-profile
 
 # ---- stub claude-profile: several subscriptions in one config dir ----------
 # For the multi-account shot only. claude-auto-window shells out to
@@ -161,6 +186,7 @@ CAW_FAKE_CP_DIR="$tmp/cp" \
 CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE=on \
 CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE_PY="$tmp/bin/claude-profile.py" \
   zsh "$caw" --status 2>/dev/null | demoize > "$tmp/cap-accounts.txt"
+require_capture "$tmp/cap-accounts.txt" multi-account
 
 # ---------------------------------------------------------------------------
 # SVG
