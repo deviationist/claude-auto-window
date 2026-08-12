@@ -78,6 +78,14 @@ differ only in transport.
     `resets_at` early-exit, no fetch). Exits **0** (clean; systemd/launchd leave
     it stopped) only when **all** profiles are disabled. Cron can't sleep — it
     relies on the `-once` early-exit gate instead.
+  - `_caw_check_one` / `claude-auto-window-check` — the **health gate**.
+    `--status` describes and exits 0; `--check` judges and exits **1** on any
+    FAIL. FAIL = tripped breaker, undeterminable state, missing hard dep, or
+    claude-profile active without `oauth.usage_url`/`token_url` (a real,
+    observed, silent failure — its stale usage cache hides it, which is why the
+    config is asserted directly). WARN (exit 0) = plan exhausted, no 5h window,
+    expired-but-self-healing token, HTTP 429. Keep WARN out of the exit code:
+    paging on routine states trains the operator to ignore it.
   - `_caw_status_one` — print the current session state **plus the balance-gate
     verdict** (`weekly_all=NN% → would fire / WOULD SKIP`, starter model, credits
     line, stored-vs-live `resets_at`) — the daemon health-check.
@@ -263,6 +271,13 @@ functions are the `claude-auto-window*` names.
   `last_open` (cooldown), `resets_at`, and `profile`; the disable **sentinel**
   (`<hash>.tripped`) is deliberately kept as its **own** file (touch/rm
   kill-switch). Only the process lock stays transient in `$TMPDIR`.
+- **A 429 is not a closed window.** `_caw_usage_json` returns a distinct rc
+  **5** for HTTP 429 so rate-limiting is never conflated with a broken account:
+  `-once` holds off until the next wake, `--status` says so, and `--check` calls
+  it WARN rather than paging. Don't collapse 5 back into 3 — the old behaviour
+  was safe (the error body failed validation) but reported "could not determine
+  window state" / "offline, or no stored credentials", which is a misleading
+  page.
 - **No 5h window ⇒ do nothing.** `_caw_session_active` returns **2** when the
   account has no `session` limit (API/usage-billed seat). `-once` turns that into
   exit **70** (safe no-op, never "closed → open" — that would spend money per
@@ -281,6 +296,7 @@ profile** until its sentinel clears) ·
 `4` starter sent but **no reply / no completion** (real failure, from
 `_caw_send_starter` or `_caw_send_starter_http`; the post-open verify never
 returns this — a received reply / HTTP 200 is treated as success) ·
+`--check` exits `1` if any target FAILs, `0` otherwise (WARN does not count) ·
 `70` account has no 5-hour window (checked-path no-op; the **daemon disables that
 profile** for its lifetime) · `75` another instance holds the per-profile lock.
 The daemon's own process exit is **0** once every profile is disabled, so

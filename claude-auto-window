@@ -216,11 +216,18 @@ _caw_usage_json() {
   emulate -L zsh
   local dir="$1" token resp rc
   token="$(_caw_resolve_token "$dir")" || { rc=$?; (( rc == 4 )) && return 4; return 3; }
-  resp="$(curl -s --connect-timeout 3 --max-time 6 \
+  local code
+  resp="$(curl -s -w $'\n__CAW_HTTP__%{http_code}' --connect-timeout 3 --max-time 6 \
     "https://api.anthropic.com/api/oauth/usage" \
     -H "Authorization: Bearer $token" \
     -H "anthropic-beta: oauth-2025-04-20" \
     -H "Content-Type: application/json" 2>/dev/null)" || return 3
+  code="${resp##*__CAW_HTTP__}"
+  resp="${resp%$'\n'__CAW_HTTP__*}"
+  # 429 is the endpoint throttling us, not a broken account. Distinct rc so the
+  # checked paths can hold off instead of concluding "closed" and firing, and so
+  # --check can call it transient rather than paging about lost credentials.
+  [[ "$code" == 429 ]] && return 5
   # Validate it's a real usage response, not an error/HTML/empty body.
   jq -e 'type == "object" and (.error == null) and ((.limits != null) or (.five_hour != null))' \
     <<< "$resp" >/dev/null 2>&1 || return 3
@@ -277,7 +284,7 @@ _caw_session_from_json() {
 _caw_session_active() {
   emulate -L zsh
   local dir="$1" json rc
-  json="$(_caw_usage_json "$dir")" || { rc=$?; (( rc == 4 )) && return 4; return 3; }
+  json="$(_caw_usage_json "$dir")" || { rc=$?; (( rc == 4 || rc == 5 )) && return $rc; return 3; }
   _caw_session_from_json "$dir" "$json" "$dir"
 }
 
@@ -301,6 +308,9 @@ _caw_status_line() {
     _caw_log ERROR "usage lookup failed for $dir"; return 1
   elif (( rc == 4 )); then
     print -r -- "profile=${_caw_c_bold}${dir}${_caw_c_reset} five_hour=${_caw_c_yellow}?${_caw_c_reset} ${_caw_c_dim}(access token expired — --once/the daemon self-heal it with a bare claude launch; any claude use also refreshes it)${_caw_c_reset}"
+    return 0
+  elif (( rc == 5 )); then
+    print -r -- "profile=${_caw_c_bold}${dir}${_caw_c_reset} five_hour=${_caw_c_yellow}?${_caw_c_reset} ${_caw_c_dim}(usage endpoint rate-limiting us — HTTP 429, transient)${_caw_c_reset}"
     return 0
   elif (( rc == 2 )); then
     print -r -- "profile=${_caw_c_bold}${dir}${_caw_c_reset} five_hour=${_caw_c_yellow}n/a${_caw_c_reset} ${_caw_c_dim}(no session window — API/usage-billed account?)${_caw_c_reset}"
@@ -1500,6 +1510,11 @@ _caw_once_one() {
     elif (( rc == 3 )); then
       _caw_log ERROR "Could not determine window state for $dir"
       return 1
+    elif (( rc == 5 )); then
+      # Rate-limited: the window state is unknown, NOT known-closed. Firing here
+      # would anchor blindly on no evidence, so hold off until the next wake.
+      _caw_log WARN "Usage endpoint is rate-limiting us (HTTP 429) for $dir — holding off until the next cycle"
+      return 1
     elif (( rc == 4 )); then
       _caw_log INFO "Proceeding to fire the starter (its send refreshes the token; visibility returns next cycle)"
     fi
@@ -1680,6 +1695,95 @@ claude-auto-window-daemon() {
   return 0
 }
 
+# ----------------------------------------------------------------------------
+# --check — the health gate. `--status` DESCRIBES state and always exits 0;
+# `--check` JUDGES it and exits non-zero, so a timer can page on it.
+#
+# This exists because every failure this tool has actually had was silent: a
+# tripped breaker sat unnoticed for ten days, and a workstation whose
+# claude-profile had no `oauth` block logged "usage unavailable" every wake for
+# weeks while both subscriptions went unkept. Something always knew; nothing
+# ever said.
+#
+# Verdicts: FAIL = broken, needs a human, exit 1. WARN = legitimate but worth
+# seeing (plan exhausted, no 5h window, token expired-but-self-healing) — exit
+# 0, because paging on these would train you to ignore it. PASS = healthy.
+# ----------------------------------------------------------------------------
+typeset -g _caw_check_failed=0
+
+_caw_check_emit() {   # <PASS|WARN|FAIL> <label> <detail>
+  emulate -L zsh
+  local v="$1" label="$2" detail="$3" c=""
+  case "$v" in
+    PASS) c="$_caw_c_green" ;;
+    WARN) c="$_caw_c_yellow" ;;
+    FAIL) c="$_caw_c_red"; _caw_check_failed=1 ;;
+  esac
+  print -r -- "${c}${v}${_caw_c_reset}  ${_caw_c_bold}${label}${_caw_c_reset}  ${detail}"
+}
+
+# Environment-level checks, run once (not per profile).
+_caw_check_env() {
+  emulate -L zsh
+  local b
+  for b in jq curl; do
+    command -v "$b" >/dev/null 2>&1 || _caw_check_emit FAIL "deps" "$b not found on PATH (hard dependency)"
+  done
+  # The claude binary is only needed for the tmux opener and the token
+  # self-heal — the http opener runs without it, so this is a WARN.
+  _caw_resolve_claude_bin >/dev/null 2>&1     || _caw_check_emit WARN "deps" "claude binary not found — the tmux opener and the token self-heal cannot run"
+  # claude-profile active but with no OAuth endpoints configured: usage lookups
+  # return nothing for every account and parked tokens can never be refreshed.
+  # It fails silently, which is exactly why it is asserted here.
+  if _caw_cp_active; then
+    local cfg; cfg="$(_caw_cp_config)"
+    jq -e '(.oauth.usage_url // "") != "" and (.oauth.token_url // "") != ""' "$cfg" >/dev/null 2>&1       || _caw_check_emit FAIL "claude-profile" "no oauth.usage_url / oauth.token_url in $cfg — per-account usage and parked-token refresh cannot work"
+  fi
+}
+
+# One target's verdict. Handles both dir- and account-targets.
+_caw_check_one() {
+  emulate -L zsh
+  local account="${CLAUDE_AUTO_WINDOW_CP_ACCOUNT:-}" dir key label json="" rc model
+  dir="$(_caw_check_dir)"
+  model="${CLAUDE_AUTO_WINDOW_MODEL-haiku}"
+  if [[ -n "$account" ]]; then
+    key="$(_caw_account_key "$dir" "$account")"; label="account:$account"
+    json="$(_caw_cp_usage_json "$account")"; rc=$?
+    (( rc == 0 )) && { _caw_session_from_json "$key" "$json" "$label"; rc=$?; } || rc=3
+  else
+    key="$dir"; label="$dir"
+    _caw_session_active "$dir"; rc=$?
+    (( rc == 0 || rc == 1 )) && json="$(_caw_usage_json "$dir")"
+  fi
+
+  # A tripped breaker outranks whatever the window happens to be doing: the
+  # account may look fine precisely because YOU used it, while the tool has
+  # been standing down for days.
+  if _caw_breaker_tripped "$key"; then
+    _caw_check_emit FAIL "$label" "circuit breaker tripped — $(_caw_breaker_reason "$key") — clear with: claude-auto-window --reset"
+    return 0
+  fi
+
+  case "$rc" in
+    0) _caw_check_emit PASS "$label" "window open until $(_caw_state_get "$key" resets_at 2>/dev/null)" ;;
+    1) if [[ -n "$json" ]] && _caw_plan_exhausted "$json" "$model"; then
+         _caw_check_emit WARN "$label" "window closed; standing down — weekly plan allowance exhausted for '${model:-<account default>}'"
+       else
+         _caw_check_emit PASS "$label" "window closed; will be opened on the next cycle"
+       fi ;;
+    2) _caw_check_emit WARN "$label" "no 5-hour window on this account (API/usage-billed seat?) — nothing to keep open" ;;
+    4) _caw_check_emit WARN "$label" "access token expired — --once and the daemon self-heal this" ;;
+    5) _caw_check_emit WARN "$label" "usage endpoint rate-limiting us (HTTP 429) — transient, state unknown this cycle" ;;
+    *) if [[ -n "$account" ]]; then
+         _caw_check_emit FAIL "$label" "window state undeterminable — claude-profile returned no usage (token lapsed, offline, or oauth not configured)"
+       else
+         _caw_check_emit FAIL "$label" "window state undeterminable — usage lookup failed (offline, or no stored credentials)"
+       fi ;;
+  esac
+  return 0
+}
+
 # Single-profile status line; the public claude-auto-window-status iterates it.
 _caw_status_one() {
   emulate -L zsh
@@ -1712,6 +1816,19 @@ claude-auto-window-run()    { emulate -L zsh; _caw_iterate _caw_run_one; }
 claude-auto-window-once()   { emulate -L zsh; _caw_iterate _caw_once_one; }
 claude-auto-window-status() { emulate -L zsh; _caw_iterate _caw_status_one; }
 claude-auto-window-reset()  { emulate -L zsh; _caw_iterate _caw_reset_one; }
+
+# Health gate: 0 = every target healthy, 1 = at least one FAIL. Unlike the other
+# iterated modes this does not surface a per-target rc — the verdicts are the
+# output, and the exit code is their aggregate.
+claude-auto-window-check() {
+  emulate -L zsh
+  _caw_color_init
+  _caw_check_failed=0
+  _caw_check_env
+  _caw_iterate _caw_check_one || true    # verdicts are the output; rc is aggregated below
+  (( _caw_check_failed )) && return 1
+  return 0
+}
 
 # ----------------------------------------------------------------------------
 # Profile specs — the multi-profile substrate. A "spec" is a single string that
@@ -1874,6 +1991,7 @@ Usage:
   claude-auto-window --daemon            # keep windows open; sleeps until expiry
   claude-auto-window --status            # print current five-hour session state
   claude-auto-window --reset             # clear a tripped circuit breaker
+  claude-auto-window --check             # health gate: exit 1 if anything is broken
 
 Profile (repeatable — one daemon/run holds N accounts open):
   --config-dir PATH        Explicit Claude profile dir (pins CLAUDE_CONFIG_DIR)
@@ -1949,9 +2067,18 @@ $XDG_CONFIG_HOME/claude-auto-window/config):
   -h, --help               Show this help.
   -v, --version            Show version.
 
+--check verdicts:
+  PASS  healthy.
+  WARN  legitimate but worth seeing (plan exhausted, no 5-hour window, access
+        token expired-but-self-healing). Does NOT affect the exit code.
+  FAIL  broken, needs a human (tripped breaker, undeterminable window state,
+        missing dependency, claude-profile without its oauth endpoints).
+  Exit 0 unless at least one FAIL — so it can drive a timer that only pages
+  when something is actually wrong.
+
 Source-able API:
   source ./claude-auto-window
-  claude-auto-window-run | -once | -daemon | -status
+  claude-auto-window-run | -once | -daemon | -status | -check
 USAGE
 }
 
@@ -1977,6 +2104,7 @@ _caw_main() {
       --daemon)          [[ $mode_set == 1 && $mode != daemon ]] && { print -u2 "pick one mode"; return 2; }; mode=daemon; mode_set=1 ;;
       --status)          [[ $mode_set == 1 && $mode != status ]] && { print -u2 "pick one mode"; return 2; }; mode=status; mode_set=1 ;;
       --reset)           [[ $mode_set == 1 && $mode != reset ]] && { print -u2 "pick one mode"; return 2; }; mode=reset; mode_set=1 ;;
+      --check)           [[ $mode_set == 1 && $mode != check ]] && { print -u2 "pick one mode"; return 2; }; mode=check; mode_set=1 ;;
       --no-verify)       typeset -gx CLAUDE_AUTO_WINDOW_VERIFY=0 ;;
       --quiet)           typeset -gx CLAUDE_AUTO_WINDOW_QUIET=1 ;;
       --force)           typeset -gx CLAUDE_AUTO_WINDOW_FORCE=1 ;;
@@ -2062,6 +2190,7 @@ _caw_main() {
     daemon) claude-auto-window-daemon ;;
     status) claude-auto-window-status ;;
     reset)  claude-auto-window-reset ;;
+    check)  claude-auto-window-check ;;
   esac
 }
 
