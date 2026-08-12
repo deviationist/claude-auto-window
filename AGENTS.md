@@ -228,6 +228,23 @@ functions are the `claude-auto-window*` names.
   generator captures output through a pipe. **Keep the plain-text line shape
   byte-identical** — only escapes are added, never re-ordered or re-worded
   fields, since `--status` is plausibly grepped in user scripts.
+- **Exactly one component maintains any given credential.** claude-profile's
+  keep-alive owns **parked** accounts — it alone can touch that store. The
+  **live** account it deliberately refuses (`skipped — live in profile "…"`),
+  because refresh tokens rotate on use and a second writer racing Claude Code
+  means a lost update and a dead credential. So the live account is repaired by
+  claude-auto-window causing a **bare, prompt-less `claude` launch**
+  (`_caw_refresh_token`) — note the writer is still Claude Code itself; this
+  script never writes a credential. The two sets are disjoint by construction:
+  `_caw_cp_is_live` gates the repair so it only ever runs for the account
+  claude-profile has explicitly declined. This is **not** a second keep-alive —
+  it is reactive (only after a check has already failed), unscheduled, and it is
+  the same self-heal the dir path has relied on since before claude-profile
+  existed, which standalone use still depends on. Don't "unify" it by removing
+  it: without claude-profile there would then be no token maintenance at all.
+  Guard it on the token actually being unusable (`_caw_resolve_token` non-zero) —
+  a fresh token with a failing usage lookup is a claude-profile-side problem no
+  launch can fix, and relaunching each wake would be pure waste.
 - **Teardown is unconditional.** `kill-session` by unique name + transcript
   cleanup run in the `always {}` block regardless of success/timeout.
 - **Isolated tmux socket** (`-L claude-auto-window`) — never touch the user's real

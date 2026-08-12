@@ -1148,6 +1148,25 @@ _caw_cp_anchor() {
   return 4
 }
 
+# Is <account> the LIVE account of <dir> (vs parked)? Read-only, no network —
+# `accounts` is claude-profile's porcelain, emitting "<account>\t<state>\t<profile>"
+# with state "active" for the live one.
+#
+# This matters because the two lapse-repairs are NOT interchangeable: a bare
+# `claude` launch refreshes whatever account is live in the dir, so it can heal
+# the live account and can do nothing at all for a parked one (whose credential
+# lives in claude-profile's own store — claude-profile's keep-alive owns that).
+_caw_cp_is_live() {
+  emulate -L zsh
+  local account="$1" dir="${2%/}" py profile state
+  py="$(_caw_cp_py)" || return 1
+  profile="$(_caw_cp_accounts | awk -F'\t' -v d="$dir" '$3==d{print $1; exit}')"
+  [[ -n "$profile" ]] || return 1
+  state="$(python3 "$py" accounts --profile "$profile" 2>/dev/null \
+           | awk -F'\t' -v a="$account" '$1==a{print $2; exit}')"
+  [[ "$state" == active ]]
+}
+
 # The account pseudo-path used to key every per-target state helper (lock, state,
 # breaker, cooldown). Absolute, so ${x:a} in the keying helpers leaves it intact,
 # and distinct from the dir's own key so a profile's live-dir target and its
@@ -1190,6 +1209,24 @@ _caw_once_account() {
 
     local json; json="$(_caw_cp_usage_json "$account")"; rc=$?
     (( rc == 0 )) && { _caw_session_from_json "$key" "$json" "$label"; rc=$?; } || rc=3
+    # Undetermined + live = the same expired-access-token dead end the dir path
+    # already self-heals (see _caw_once_one's rc 4 branch), which this path never
+    # did: claude-profile deliberately won't refresh a live token, so without
+    # this the account just reports "usage unavailable" every wake, forever.
+    # The launch is prompt-less: nothing is sent, no window opens, nothing spent.
+    # Only worth a launch if the stored token is actually unusable. If it is
+    # still fresh (as the dir-target path proves whenever it reports state for
+    # the same dir), then an unavailable usage lookup is a claude-profile-side
+    # problem and no launch can fix it — without this guard we would relaunch
+    # claude every single wake to no effect.
+    local _trc; _caw_resolve_token "$dir" >/dev/null 2>&1; _trc=$?
+    if (( rc == 3 && _trc != 0 )) && _caw_cp_is_live "$account" "$dir"; then
+      _caw_log INFO "[$account] window state unavailable and this is the live account — refreshing its token with a bare claude launch (nothing sent), then re-checking"
+      if _caw_refresh_token "$dir"; then
+        json="$(_caw_cp_usage_json "$account")"; rc=$?
+        (( rc == 0 )) && { _caw_session_from_json "$key" "$json" "$label"; rc=$?; } || rc=3
+      fi
+    fi
     if (( rc == 0 )); then
       _caw_breaker_reset "$key"
       _caw_log INFO "[$account] window already open; nothing to do"
@@ -1244,11 +1281,19 @@ Re-enable with:  claude-auto-window --reset
     _caw_breaker_inc "$key" >/dev/null
     _caw_cp_anchor "$account"; rc=$?
     if (( rc == 5 )); then
-      # LIVE account, token lapsed → a real claude launch in the dir refreshes it
-      # AND anchors the live account (parked accounts can't use this — the launch
-      # would anchor whichever account is live, not the parked one).
-      _caw_log INFO "[$account] live token lapsed — falling back to a tmux launch to refresh + anchor"
-      _caw_open_window "$dir" 0; rc=$?
+      # LIVE account, token lapsed. Try the FREE repair first: a prompt-less
+      # launch refreshes the credential without sending anything, after which
+      # claude-profile can anchor over HTTP as usual. Only if that fails do we
+      # fall back to the launch that also sends (parked accounts can't use
+      # either — the launch acts on whichever account is live).
+      _caw_log INFO "[$account] live token lapsed — refreshing it with a bare claude launch (nothing sent), then retrying the anchor"
+      if _caw_refresh_token "$dir"; then
+        _caw_cp_anchor "$account"; rc=$?
+      fi
+      if (( rc != 0 )); then
+        _caw_log INFO "[$account] still cannot anchor — falling back to a tmux launch that refreshes and sends"
+        _caw_open_window "$dir" 0; rc=$?
+      fi
     fi
     (( rc == 0 )) || return "$rc"
     _caw_mark_opened "$key"
