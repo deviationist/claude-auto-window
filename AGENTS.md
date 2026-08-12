@@ -27,10 +27,10 @@ differ only in transport.
 | File | Role |
 |---|---|
 | `claude-auto-window` | The whole tool — one self-contained script (OAuth read + usage fetch inlined). Executable **and** source-able. |
-| `claude-auto-window.env.example` → config | Auto-loaded from `$XDG_CONFIG_HOME/claude-auto-window/config` in `_caw_main` (`_caw_load_config`); fills only unset `CLAUDE_AUTO_WINDOW_*` vars (env/flags win). |
+| `claude-auto-window.env.example` | Every `CLAUDE_AUTO_WINDOW_*` knob, documented. Doubles as the config-file template: auto-loaded from `$XDG_CONFIG_HOME/claude-auto-window/config` in `_caw_main` (`_caw_load_config`), filling only unset vars (env/flags win). |
 | `claude-auto-window@.service` | systemd `--user` template (Linux daemon), keyed on profile via `%i`. |
 | `claude-auto-window.plist` | launchd template (macOS daemon), `__HOME__` placeholders. |
-| `claude-auto-window.env.example` | Every `CLAUDE_AUTO_WINDOW_*` knob. |
+| `README.md` | User-facing docs. Keep in sync when flags, defaults or behaviour change. |
 
 ## Architecture (control flow)
 
@@ -81,7 +81,7 @@ differ only in transport.
     verdict** (`weekly_all=NN% → would fire / WOULD SKIP`, starter model, credits
     line, stored-vs-live `resets_at`) — the daemon health-check.
 - **Both `-run` and `-once` open a window via** `_caw_open_window` → a
-  **strategy dispatcher** on `CLAUDE_AUTO_WINDOW_OPENER` (`tmux` default | `http`).
+  **strategy dispatcher** on `CLAUDE_AUTO_WINDOW_OPENER` (`http` default | `tmux`).
   It calls the matching wrapper, then stamps `_caw_mark_opened` on success (rc 0).
   - **`_caw_open_window_tmux`** — `_caw_send_starter` + the
     **cheapest-model-with-fallback** retry (rc 4 → retry on the account default).
@@ -249,13 +249,15 @@ functions are the `claude-auto-window*` names.
 ## Exit codes
 
 `0` ok · `1` general error · `2` config/usage-parse error (fatal in daemon) ·
-`3` circuit breaker tripped (checked path refuses; **daemon exits cleanly**) ·
+`3` circuit breaker tripped (checked path refuses; the **daemon disables that
+profile** until its sentinel clears) ·
 `4` starter sent but **no reply / no completion** (real failure, from
 `_caw_send_starter` or `_caw_send_starter_http`; the post-open verify never
 returns this — a received reply / HTTP 200 is treated as success) ·
-`70` account has no 5-hour window (checked-path no-op; the **daemon exits
-cleanly** so systemd leaves it stopped) · `75` another instance holds the
-per-profile lock.
+`70` account has no 5-hour window (checked-path no-op; the **daemon disables that
+profile** for its lifetime) · `75` another instance holds the per-profile lock.
+The daemon's own process exit is **0** once every profile is disabled, so
+systemd/launchd leave it stopped.
 
 **Multi-profile aggregation:** the iterated modes (`--once`/`--run`/`--status`/
 `--reset`) run every profile and return the **first** non-zero rc seen. The daemon
@@ -341,6 +343,7 @@ exit is **0** once all profiles are disabled.
   launch never happens because the check fails). And never add a prompt
   argument to `_caw_refresh_token`'s launch — prompt-less is what makes the
   self-heal free.
+- **A first run in a new starter dir shows the workspace-trust**
   dialog; `_caw_wait_reply` auto-accepts it (Enter = "Yes, I trust this folder").
   This writes one `~/.claude.json` trust entry per starter dir — which is why the
   default starter dir is a **stable** tmp path, not a fresh one per run.
