@@ -247,6 +247,7 @@ claude-auto-window --run --force  # ...and skip even the "no 5h window" safety c
 claude-auto-window --daemon     # service every profile, sleeping until the next expiry
 claude-auto-window --status     # print current 5h session state
 claude-auto-window --reset      # clear a tripped circuit breaker (see below)
+claude-auto-window --check      # health gate: exit 1 if anything is broken
 ```
 
 `--status` colorizes its output when stdout is a terminal — the window state, the
@@ -388,6 +389,34 @@ the separate Fable cap was maxed.)
   `weekly_all=NN%  →  would fire / WOULD SKIP` (naming the starter model), a
   `credits=USED/LIMIT …` line when the account has usage credits enabled, and the
   daemon's stored `resets_at` when it differs from the live one.
+
+## Health check (`--check`)
+
+`--status` *describes* state and always exits 0. `--check` *judges* it and
+**exits 1 when something is broken**, so a timer can page you only when it
+matters:
+
+```
+PASS  account:max20x  window open until 2026-08-12T12:20:00+00:00
+WARN  account:max5x   window closed; standing down — weekly plan allowance exhausted
+FAIL  /home/you/.claude  circuit breaker tripped — 3 consecutive anchors … — clear with: claude-auto-window --reset
+```
+
+- **FAIL** (exit 1) — a tripped breaker, an undeterminable window state, a
+  missing hard dependency, or claude-profile active without its `oauth`
+  endpoints configured.
+- **WARN** (exit 0) — legitimate but worth seeing: plan allowance exhausted, no
+  5-hour window on the account, an expired access token (which `--once` and the
+  daemon self-heal), or the usage endpoint rate-limiting us (HTTP 429, transient).
+  Paging on these would just train you to ignore the alert.
+- **PASS** — healthy.
+
+Wire it to whatever actually reaches you on that host — `mail` where a relay
+exists, `osascript` on a Mac. Every failure this tool has had in practice was
+**silent**: a tripped breaker sat unnoticed for ten days, and a workstation
+whose claude-profile had no `oauth` block reported "usage unavailable" every
+cycle for weeks while both subscriptions went unkept. Something always knew;
+nothing ever said. That's what this closes.
 
 ## Loop protection (circuit breaker)
 
