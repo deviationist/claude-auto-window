@@ -31,7 +31,7 @@ differ only in transport.
 | `claude-auto-window@.service` | systemd `--user` template (Linux daemon), keyed on profile via `%i`. |
 | `claude-auto-window.plist` | launchd template (macOS daemon), `__HOME__` placeholders. |
 | `README.md` | User-facing docs. Keep in sync when flags, defaults or behaviour change. |
-| `tools/generate-readme-svg.zsh` | Regenerates `assets/*.svg`. Runs the REAL script in a sandbox (stub `curl`/`security`/claude-profile) and renders its captured output; the timeline is hand-authored. Re-run after any `--status` format or color change. |
+| `tools/generate-readme-svg.zsh` | Regenerates `assets/*.svg`. Runs the REAL script in a sandbox (stub `curl`/`security`/`date`/claude-profile) and renders its captured output; the hero animates three captures, the timeline is hand-authored. Re-run after any `--status` format or color change. |
 
 ## Architecture (control flow)
 
@@ -320,11 +320,28 @@ output, and it drifts the moment the line format or palette changes — re-run t
 generator, don't patch the SVG. The only edit made to captured text is rewriting
 the mktemp sandbox path to `/home/demo`.
 
-The third, `timeline`, is a **schematic** of the daemon's sleep/fire cycle, drawn
-by hand because there is no output to photograph. It animates via CSS keyframes
-(an SVG in an `<img>` has scripting disabled but declarative animation live), and
-every animated element's BASE state is the fire-moment frame, so
-`prefers-reduced-motion` freezes it somewhere legible rather than blank.
+`status`, the hero, is **animated out of three such captures**: the command types
+itself in (one frame per keystroke), then the window is shown open, lapsed, and
+freshly re-anchored. All three runs happen within the same second of wall clock,
+so a stub **`date`** stages a shared story clock for them — it intercepts *only*
+`date -u +%Y-%m-%dT%H:%M:%S`, the exact invocation the open/closed compare uses,
+and passes everything else through to the real binary. Without it the lapsed
+frame could only be built by back-dating its `resets_at`, which would then
+contradict the frame before it. A guard in the generator asserts the lapsed frame
+really does read `five_hour_open=no`, so a refactor of how "now" is fetched fails
+the generator instead of silently shipping three identical open windows.
+
+`timeline` is a **schematic** of the daemon's sleep/fire cycle, drawn by hand
+because there is no output to photograph.
+
+Both animate via CSS keyframes, never SMIL or script — an SVG in an `<img>` has
+scripting disabled but declarative animation live. `status` stacks one `<g>` per
+frame and steps opacity with `step-end` (a hard cut; two stops at the same
+percentage would collapse and cross-fade instead), and carries `opacity="0"` as a
+presentation attribute on every frame but the last, so a renderer ignoring
+`<style>` shows the final state rather than all frames at once. In `timeline`
+every animated element's BASE state is the fire-moment frame. Either way
+`prefers-reduced-motion` freezes on something legible rather than blank.
 
 Filenames carry a random hash purely to bust GitHub's camo cache; the generator
 rewrites the README refs and deletes superseded files.

@@ -6,7 +6,7 @@ current window has lapsed, it opens a fresh one with a single trivial request.
 That one request anchors a new 5-hour window at minimal token cost.
 
 <p align="center">
-  <img src="assets/status-294c8e.svg" alt="A terminal showing claude-auto-window --status: the five-hour window is open at 34 percent with its reset time, the balance gate reports it would fire a starter on the haiku model, and no usage credits have been spent">
+  <img src="assets/status-dc9350.svg" alt="A terminal running claude-auto-window --status three times along one clock. First the five-hour window is open at 34 percent, with its reset time and a balance gate that says it would fire a starter on the haiku model. Two and a half hours later the same window has lapsed — open reads no, and that is the moment the daemon wakes. A minute after that a starter has fired: a fresh window is open at 1 percent, resetting five hours out">
 </p>
 
 There are **two opener strategies** (`--opener`):
@@ -168,7 +168,7 @@ resolved from claude-profile's own config, so the two tools never disagree).
   `claude-profile auth <account>`.
 
 <p align="center">
-  <img src="assets/accounts-294c8e.svg" alt="claude-auto-window --status across two subscriptions in one config dir: max20x has an open window and would fire, while max5x has a closed window but a spent weekly allowance, so the balance gate reports WOULD SKIP instead of burning usage credits">
+  <img src="assets/accounts-dc9350.svg" alt="claude-auto-window --status across two subscriptions in one config dir: max20x has an open window and would fire, while max5x has a closed window but a spent weekly allowance, so the balance gate reports WOULD SKIP instead of burning usage credits">
 </p>
 
 ```sh
@@ -455,7 +455,7 @@ State lives in `$CLAUDE_AUTO_WINDOW_STATE_DIR` (default
 ## The daemon doesn't poll continuously
 
 <p align="center">
-  <img src="assets/timeline-294c8e.svg" alt="A timeline of two consecutive five-hour windows: the first fills while the daemon sleeps rather than polling, then just after it expires the daemon wakes, checks, fires one starter, and the second window opens — about two requests per window">
+  <img src="assets/timeline-dc9350.svg" alt="A timeline of two consecutive five-hour windows: the first fills while the daemon sleeps rather than polling, then just after it expires the daemon wakes, checks, fires one starter, and the second window opens — about two requests per window">
 </p>
 
 When a window is open, the daemon knows exactly when it ends (`resets_at`), so it
@@ -649,14 +649,22 @@ claude-auto-window-once
 
 ## Regenerating the README images
 
-The two terminal shots are **real output**, not mockups: the generator builds a
+The terminal shots are **real output**, not mockups: the generator builds a
 hermetic sandbox (fake `$HOME`, a stub `curl` standing in for the usage endpoint,
 a stub `security` so the Keychain is never touched, and a stub claude-profile for
 the multi-account shot) and runs this script's own `--status` unmodified with
-`CLAUDE_AUTO_WINDOW_COLOR=always`. Only the window chrome is drawn. The timeline
-is a schematic — there's no output to photograph when the subject is five hours
-passing — and is animated with CSS keyframes, frozen by `prefers-reduced-motion`
-on a frame that still tells the whole story.
+`CLAUDE_AUTO_WINDOW_COLOR=always`. Only the window chrome is drawn.
+
+The hero is **animated**: the command types itself in, then three genuine
+`--status` runs play as frames — a window open, that same window lapsed, and the
+fresh one a starter just anchored. All three are captured within the same second,
+so a stub `date` gives them a shared *story* clock and the `resets_at` each frame
+prints agrees with the ones on either side of it; a badge names how far the clock
+jumped. The timeline is a schematic instead — there's no output to photograph when
+the subject is five hours passing. Both animate with CSS keyframes rather than
+SMIL or script, since an SVG in an `<img>` (how GitHub serves a README asset,
+through camo) is rendered with scripting disabled but declarative animation live.
+`prefers-reduced-motion` freezes each on a frame that still tells the story.
 
 ```sh
 zsh tools/generate-readme-svg.zsh          # → assets/*.svg + README refs, commit all

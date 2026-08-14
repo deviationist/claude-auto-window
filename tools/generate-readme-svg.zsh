@@ -24,6 +24,14 @@
 #     thing worth showing is what happens across five hours. It is hand-authored
 #     below and animated with a CSS keyframe timeline; prefers-reduced-motion
 #     freezes it.
+#   * the hero (`status`) is animated too, but out of real captures rather than
+#     drawing: the command types itself in, then THREE genuine `--status` runs
+#     play as frames — window open, the same window lapsed, and the fresh one a
+#     starter just anchored. Same CSS-keyframe mechanism as ccfind's demo (one
+#     <g> per frame, opacity stepped by the timeline); see `anim_svg` below.
+#     Because the three runs happen within the same second of wall clock, a stub
+#     `date` gives them a shared *story* clock, so the resets_at each frame
+#     prints lines up with the ones before and after it.
 #
 # Usage:  zsh tools/generate-readme-svg.zsh
 #           → assets/{status,accounts,timeline}-<hash>.svg, older ones deleted,
@@ -45,6 +53,16 @@ root=${here:h}
 
 tmp=$(cd "$(mktemp -d)" && pwd -P)
 trap 'rm -rf "$tmp"' EXIT
+
+# The story clock. Every demo timestamp is an offset from this one instant, so
+# the three frames of the animated hero agree with each other about when the
+# window opened, when it lapsed and when the next one starts — which a live
+# EPOCHSECONDS, drifting a few seconds across the run, would not give.
+integer T0=$EPOCHSECONDS
+
+# Resolved before the stub dir goes on PATH, so the stub can call the real one
+# without recursing into itself.
+REAL_DATE=$(whence -p date) || { print -u2 "generate-readme-svg: no date(1) on PATH"; exit 1 }
 
 # ---- hermetic sandbox ------------------------------------------------------
 # A fake $HOME plus a stubbed PATH. Nothing here reads the operator's real
@@ -81,7 +99,26 @@ cat > "$tmp/bin/security" <<'STUB'
 exit 1
 STUB
 
-chmod +x "$tmp/bin/curl" "$tmp/bin/security"
+# stub date: moves "now" for the animated hero, and ONLY for it.
+#
+# The open/closed decision is a lexical compare of resets_at against
+# `date -u +%Y-%m-%dT%H:%M:%S` — that exact invocation and no other. Intercept
+# just that form when $CAW_FAKE_NOW is set, and pass everything else (logging
+# stamps, the -j -f / -d parses in _caw_iso_to_epoch, this generator's own
+# utc_iso) straight through to the real binary. Without this every frame would
+# be captured at the same instant, so the lapsed frame could only be built by
+# back-dating its resets_at — and its timestamp would then contradict the frame
+# before it, in an image whose whole point is that the clock moved.
+cat > "$tmp/bin/date" <<STUB
+#!/bin/sh
+if [ "\$1" = "-u" ] && [ "\$2" = "+%Y-%m-%dT%H:%M:%S" ] && [ -n "\${CAW_FAKE_NOW:-}" ]; then
+  "$REAL_DATE" -u -r "\$CAW_FAKE_NOW" "+%Y-%m-%dT%H:%M:%S" 2>/dev/null && exit 0
+  exec "$REAL_DATE" -u -d "@\$CAW_FAKE_NOW" "+%Y-%m-%dT%H:%M:%S"
+fi
+exec "$REAL_DATE" "\$@"
+STUB
+
+chmod +x "$tmp/bin/curl" "$tmp/bin/security" "$tmp/bin/date"
 export PATH="$tmp/bin:$PATH"
 
 # ---- canned usage payloads -------------------------------------------------
@@ -99,9 +136,9 @@ utc_iso() {   # <epoch> → 2026-08-12T13:02:38.000000+00:00
   print -r -- "${o}.000000+00:00"
 }
 
-usage_json() {   # <session-percent> <resets-in-seconds> <weekly-all-percent> [scoped-name] [scoped-percent]
+usage_json() {   # <session-percent> <resets-at-offset-from-T0> <weekly-all-percent> [scoped-name] [scoped-percent]
   local pct=$1 resets_in=$2 wall=$3 sname=${4:-} spct=${5:-0}
-  local resets; resets=$(utc_iso $(( EPOCHSECONDS + resets_in )))
+  local resets; resets=$(utc_iso $(( T0 + resets_in )))
   local scoped=""
   [[ -n $sname ]] && scoped=",{\"kind\":\"weekly_scoped\",\"percent\":$spct,\"severity\":\"normal\",\"scope\":{\"model\":{\"display_name\":\"$sname\"}}}"
   cat <<JSON
@@ -146,17 +183,48 @@ require_capture() {   # <file> <label>
 # the colours, the field order and the values are all the script's own.
 demoize() { sed -e "s|$fakehome|/home/demo|g" }
 
-capture() {   # <outfile> <usage-file> [extra args...]
-  local out=$1 usage=$2; shift 2
-  CAW_FAKE_USAGE="$usage" CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE=off \
+capture() {   # <outfile> <usage-file> <fake-now-epoch> [extra args...]
+  local out=$1 usage=$2 now=$3; shift 3
+  rm -rf "$tmp/state/caw"    # no daemon-stored resets_at line bleeding between frames
+  CAW_FAKE_USAGE="$usage" CAW_FAKE_NOW="$now" CLAUDE_AUTO_WINDOW_CLAUDE_PROFILE=off \
     zsh "$caw" --status "$@" 2>/dev/null | demoize > "$out"
 }
 
-# 1. the hero: a single profile, window open, plenty of plan left.
-usage_json 34 9480 22 Fable 71 > "$tmp/usage-open.json"
-rm -rf "$tmp/state/caw"
-capture "$tmp/cap-status.txt" "$tmp/usage-open.json"
-require_capture "$tmp/cap-status.txt" single-profile
+# 1. the hero: one profile, photographed three times along a single story clock.
+#
+#    T0            window 1 open, 34% used, resets at R1 (2h 38m out)
+#    R1 + 5s       that window has lapsed — resets_at is now in the past, and
+#                  this is exactly when the daemon wakes (--post-expiry, 5s)
+#    R1 + 65s      a starter has fired: a fresh window, barely used, resetting
+#                  five hours after the one it replaced
+#
+#    The percentages and verdicts are the script's own; only *when* each run
+#    thinks it is happening is staged, via the stub date.
+integer R1=9480                        # window 1's resets_at, as an offset from T0
+integer NOW_OPEN=$T0
+integer NOW_LAPSED=$(( T0 + R1 + 5 ))
+integer NOW_FRESH=$(( T0 + R1 + 65 ))
+
+usage_json 34 $R1                 22 Fable 71 > "$tmp/usage-open.json"
+usage_json  0 $R1                 22 Fable 71 > "$tmp/usage-lapsed.json"
+usage_json  1 $(( R1 + 60 + 18000 )) 22 Fable 71 > "$tmp/usage-fresh.json"
+
+capture "$tmp/cap-open.txt"   "$tmp/usage-open.json"   $NOW_OPEN
+capture "$tmp/cap-lapsed.txt" "$tmp/usage-lapsed.json" $NOW_LAPSED
+capture "$tmp/cap-fresh.txt"  "$tmp/usage-fresh.json"  $NOW_FRESH
+require_capture "$tmp/cap-open.txt"   window-open
+require_capture "$tmp/cap-lapsed.txt" window-lapsed
+require_capture "$tmp/cap-fresh.txt"  window-fresh
+
+# The frames only tell the intended story if the middle one actually reads as a
+# closed window — which depends on the stub date being reached. Assert it, so a
+# refactor that changes how "now" is fetched fails here instead of shipping an
+# image of three identical open windows.
+grep -q 'five_hour_open=.*no' "$tmp/cap-lapsed.txt" || {
+  print -u2 "generate-readme-svg: the lapsed frame still reads as an OPEN window."
+  print -u2 "  The stub date is not being reached — check how the open/closed compare fetches 'now'."
+  exit 1
+}
 
 # ---- stub claude-profile: several subscriptions in one config dir ----------
 # For the multi-account shot only. claude-auto-window shells out to
@@ -195,6 +263,8 @@ require_capture "$tmp/cap-accounts.txt" multi-account
 BG='#1e1e2e'  BAR='#181825'  FG='#cdd6f4'  DIMC='#9399b2'
 DOT1='#f38ba8' DOT2='#f9e2af' DOT3='#a6e3a1'
 ACC='#89dceb'                       # shell prompt
+GREEN='#a6e3a1' YELLOW='#f9e2af' BLUE='#89b4fa' MAUVE='#cba6f7'
+CHIP='#313244' RULE='#45475a'       # the time-jump badge on the animated hero
 # The 8 normal + 8 bright ANSI foregrounds these images can contain.
 typeset -a ANSI_N ANSI_B
 ANSI_N=('#45475a' '#f38ba8' '#a6e3a1' '#f9e2af' '#89b4fa' '#f5c2e7' '#94e2d5' '#bac2de')
@@ -265,6 +335,9 @@ render_ansi() {
 # emit_lines <array-name> <y0> — draw the pane. Entry format TYPE|content:
 #   b = blank   t = plain   c = dim   a = ANSI (captured output)
 #   d = shell command line: prompt in accent, command in FG, block cursor after
+#   p = the same line once it has been submitted — no cursor, because on the
+#       animated hero the cursor's job is to show the typing, and leaving it
+#       parked mid-line under three screens of output reads as a hung terminal
 emit_lines() {
   local -a _l=("${(@P)1}")
   integer y0=$2
@@ -280,8 +353,13 @@ emit_lines() {
       c) out+="$T fill=\"$DIMC\"><tspan x=\"$(xrun 0 ${#body})\">$(xesc "$body")</tspan></text>"$'\n' ;;
       a) render_ansi "$body"
          out+="$T fill=\"$FG\">$RENDERED</text>"$'\n' ;;
-      d) out+="  <rect x=\"$(xat $(( ${#body} + 3 )))\" y=\"$(( y - FS + 1 ))\" width=\"8\" height=\"$(( FS + 3 ))\" fill=\"$FG\" opacity=\"0.75\"/>"$'\n'
-         out+="$T><tspan x=\"$(xat 0)\" fill=\"$ACC\">$</tspan><tspan x=\"$(xrun 2 ${#body})\" fill=\"$FG\">$(xesc "$body")</tspan></text>"$'\n' ;;
+      d) out+="  <rect x=\"$(xat $(( ${#body} + 2 )))\" y=\"$(( y - FS + 1 ))\" width=\"8\" height=\"$(( FS + 3 ))\" fill=\"$FG\" opacity=\"0.75\"/>"$'\n'
+         out+="$T><tspan x=\"$(xat 0)\" fill=\"$ACC\">$</tspan>"
+         [[ -n $body ]] && out+="<tspan x=\"$(xrun 2 ${#body})\" fill=\"$FG\">$(xesc "$body")</tspan>"
+         out+="</text>"$'\n' ;;
+      p) out+="$T><tspan x=\"$(xat 0)\" fill=\"$ACC\">$</tspan>"
+         [[ -n $body ]] && out+="<tspan x=\"$(xrun 2 ${#body})\" fill=\"$FG\">$(xesc "$body")</tspan>"
+         out+="</text>"$'\n' ;;
     esac
     (( i++ ))
   done
@@ -296,6 +374,19 @@ chrome() {
   print -r -- "  <rect y=\"$(( TH - 6 ))\" width=\"$W\" height=\"6\" fill=\"$BAR\"/>"
   print -r -- "  <circle cx=\"18\" cy=\"$(( TH / 2 ))\" r=\"5.5\" fill=\"$DOT1\"/><circle cx=\"36\" cy=\"$(( TH / 2 ))\" r=\"5.5\" fill=\"$DOT2\"/><circle cx=\"54\" cy=\"$(( TH / 2 ))\" r=\"5.5\" fill=\"$DOT3\"/>"
   print -r -- "  <text x=\"$(( W / 2 ))\" y=\"$(( TH / 2 + 5 ))\" text-anchor=\"middle\" font-family=\"$FONT\" font-size=\"12\" fill=\"$DIMC\">$3</text>"
+}
+
+# chip <W> <text> — the little badge on the animated hero's first row, naming
+# how far the clock jumped between this frame and the one before it. Drawn
+# chrome, not captured text — the terminal has no way to say "and then five
+# hours passed", which is precisely the thing the image exists to say.
+chip() {
+  integer W=$1
+  local txt=$2
+  integer tw=$(( ${#txt} * 6.7 + 24 ))
+  integer x=$(( W - tw - 16 )) y=$(( TH + 7 ))
+  print -r -- "  <rect x=\"$x\" y=\"$y\" width=\"$tw\" height=\"22\" rx=\"11\" fill=\"$CHIP\" stroke=\"$RULE\"/>"
+  print -r -- "  <text x=\"$(( x + tw / 2 ))\" y=\"$(( y + 15 ))\" text-anchor=\"middle\" font-family=\"$FONT\" font-size=\"11\" fill=\"$YELLOW\">$(xesc "$txt")</text>"
 }
 
 svg_open() {
@@ -327,6 +418,93 @@ term_svg() {
 }
 
 # ---------------------------------------------------------------------------
+# the animated hero
+# ---------------------------------------------------------------------------
+# The command types itself in, then the three captures play as frames: one <g>
+# per frame, each visible for its slice of a looping cycle, switched by a CSS
+# keyframe timeline. No script — an SVG in an <img> (which is how GitHub serves
+# a README asset, through camo) is rendered with scripting disabled but
+# declarative animation live, so keyframes are the mechanism that survives the
+# trip. Same machinery as ccfind's demo, and as the timeline below.
+#
+# cap_lines <out-array> <capture-file> <cmd> <chip> — one frame: the submitted
+# command line, a blank, then the captured output.
+cap_lines() {
+  local -a _o=("p|$3" "b|")
+  local ln
+  while IFS= read -r ln; do _o+=("a|$ln"); done < "$2"
+  set -A "$1" "${_o[@]}"
+}
+
+# hm <seconds> — "2h 38m" / "1m" / "45s". Used for the chip labels, so what they
+# claim about the clock is derived from the same offsets the captures used
+# rather than typed in alongside them and left to drift.
+hm() {
+  integer s=$1 h=$(( $1 / 3600 )) m=$(( ($1 % 3600) / 60 ))
+  if   (( h )); then print -rn -- "${h}h${m:+ ${m}m}"
+  elif (( m )); then print -rn -- "${m}m"
+  else               print -rn -- "${s}s"
+  fi
+}
+
+# anim_svg <cmd> <aria> — assumes FR / FR_CHIP / FR_DUR are populated.
+anim_svg() {
+  local cmd=$1 aria=$2
+  integer nlines=0 cols=0 n j
+  local arr e
+  for arr in "${FR[@]}"; do
+    local -a _l=("${(@P)arr}")
+    (( ${#_l} > nlines )) && nlines=${#_l}
+    for e in "${_l[@]}"; do
+      n=$(vlen "${e#*|}")
+      [[ ${e%%\|*} == (d|p) ]] && (( n += 4 ))     # "$ " plus the block cursor
+      (( n > cols )) && cols=$n
+    done
+  done
+  integer W=$(canvas_w $cols) H=$(canvas_h $nlines)
+
+  integer total=0
+  for n in "${FR_DUR[@]}"; do (( total += n )); done
+
+  svg_open $W $H "$aria"
+  # Each frame owns a window of the cycle, and the switch has to be a hard cut —
+  # a terminal does not dissolve between states, and a frame that fades leaves
+  # the one behind it showing through. step-end is what guarantees that; writing
+  # two stops at the same percentage does NOT, because duplicate stops collapse
+  # to the last declaration and the browser interpolates the whole way.
+  print -r -- "  <style>"
+  print -r -- "    .fr{opacity:0}"
+  integer at=0
+  local -F p0 p1
+  for (( j = 1; j <= ${#FR}; j++ )); do
+    p0=$(( at * 100.0 / total ))
+    (( at += FR_DUR[j] ))
+    p1=$(( at * 100.0 / total ))
+    print -r -- "    #fr$j{animation:k$j ${total}ms step-end infinite}"
+    if   (( j == 1 ));      then printf '    @keyframes k%d{0%%{opacity:1}%.3f%%{opacity:0}}\n' $j $p1
+    elif (( j == ${#FR} )); then printf '    @keyframes k%d{0%%{opacity:0}%.3f%%{opacity:1}}\n' $j $p0
+    else printf '    @keyframes k%d{0%%{opacity:0}%.3f%%{opacity:1}%.3f%%{opacity:0}}\n' $j $p0 $p1
+    fi
+  done
+  print -r -- "    @media (prefers-reduced-motion:reduce){.fr{animation:none!important;opacity:0}#fr${#FR}{opacity:1}}"
+  print -r -- "  </style>"
+  chrome $W $H "$cmd"
+  for (( j = 1; j <= ${#FR}; j++ )); do
+    # opacity="0" as a presentation attribute on every frame but the LAST: CSS
+    # (and so the animation) overrides it, changing nothing where the timeline
+    # runs — but a renderer that ignores <style> altogether then shows one frame
+    # instead of all of them stacked, and the one worth showing is the final
+    # state, which is what prefers-reduced-motion picks too. First-frame-visible
+    # would mean a bare prompt, since the command types itself in.
+    print -r -- "  <g id=\"fr$j\" class=\"fr\"$( (( j < ${#FR} )) && print -n ' opacity="0"')>"
+    emit_lines ${FR[j]} $(( TH + PY ))
+    [[ -n ${FR_CHIP[j]} ]] && chip $W "${FR_CHIP[j]}"
+    print -r -- "  </g>"
+  done
+  svg_close
+}
+
+# ---------------------------------------------------------------------------
 # the timeline: a schematic, not a capture
 # ---------------------------------------------------------------------------
 # The one thing about this tool that prose keeps needing a paragraph for is what
@@ -341,8 +519,6 @@ term_svg() {
 # trip. Every animated element's BASE state is the frame the animation would
 # show at the moment the starter fires, so prefers-reduced-motion (which turns
 # the animations off) freezes on a frame that still tells the whole story.
-GREEN='#a6e3a1' YELLOW='#f9e2af' BLUE='#89b4fa' MAUVE='#cba6f7'
-
 timeline_svg() {
   integer W=880 H=276
   integer X0=170 X1=850            # the time axis
@@ -446,9 +622,32 @@ else
 fi
 name() { [[ -n $hash ]] && print -rn -- "$1-$hash.svg" || print -rn -- "$1.svg" }
 
-term_svg "$tmp/cap-status.txt" "claude-auto-window --status" \
-  "claude-auto-window --status" \
-  "A terminal showing claude-auto-window --status for one profile: the five-hour window is open at 34 percent with its reset time, the balance gate says it would fire a starter on the haiku model, and no usage credits have been spent." \
+# ---- the hero's frames -----------------------------------------------------
+CMD="claude-auto-window --status"
+typeset -a FR FR_CHIP FR_DUR
+
+# One frame per keystroke, on exactly the opacity mechanism every other frame
+# uses — no clip-path, no transform — so the typing rides on the machinery
+# already known to survive the trip through camo. Each is a single short line,
+# so 27 of them cost almost nothing.
+integer ci
+for (( ci = 0; ci < ${#CMD}; ci++ )); do
+  set -A "type$ci" "d|${CMD[1,ci]}"
+  FR+=("type$ci"); FR_CHIP+=(''); FR_DUR+=(55)
+done
+set -A typed "d|$CMD"                       # …and a beat on the full line before ⏎
+FR+=(typed); FR_CHIP+=(''); FR_DUR+=(700)
+
+cap_lines f_open   "$tmp/cap-open.txt"   "$CMD"
+cap_lines f_lapsed "$tmp/cap-lapsed.txt" "$CMD"
+cap_lines f_fresh  "$tmp/cap-fresh.txt"  "$CMD"
+FR+=(f_open f_lapsed f_fresh)
+FR_CHIP+=('' "+$(hm $(( NOW_LAPSED - NOW_OPEN )))  ·  window lapsed" \
+             "+$(hm $(( NOW_FRESH - NOW_LAPSED )))  ·  starter fired")
+FR_DUR+=(2800 2800 4200)
+
+anim_svg "$CMD" \
+  "A terminal running claude-auto-window --status three times along one clock. First the five-hour window is open at 34 percent, with its reset time and a balance gate that says it would fire a starter on the haiku model. Two and a half hours later the same window has lapsed — open reads no, and that is the moment the daemon wakes. A minute after that a starter has fired: a fresh window is open at 1 percent, resetting five hours out." \
   > "$outdir/$(name status)"
 
 term_svg "$tmp/cap-accounts.txt" "claude-auto-window --status — two subscriptions" \
