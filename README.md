@@ -267,7 +267,11 @@ exactly as before, and existing `<hash>.state` files carry over unchanged.
 The `default` profile is a transparent passthrough: `CLAUDE_CONFIG_DIR` is never
 set, so Claude Code resolves `~/.claude` exactly as a bare `claude` call would.
 Any other profile is an absolute config dir, pinned via `CLAUDE_CONFIG_DIR` only
-for that profile's launch.
+for that profile's launch — with one exception: a profile that resolves to
+`~/.claude` is a passthrough too, however it was named. Pinning the default dir
+is not the no-op it looks like, because `CLAUDE_CONFIG_DIR` also moves the global
+`.claude.json` inside it, onto a file that has never been onboarded — so the
+launch would open the first-run setup wizard instead of Claude.
 
 Three ways to name profiles (a name is `default`, an absolute dir, or a
 **claude-profile profile name**):

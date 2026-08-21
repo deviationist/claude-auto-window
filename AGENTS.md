@@ -211,6 +211,16 @@ functions are the `claude-auto-window*` names.
 - **Profile passthrough:** the `default` spec means `CLAUDE_CONFIG_DIR` is
   **never set** — Claude Code resolves `~/.claude` on its own. Only an absolute-dir
   spec pins it (`_caw_pin_profile`). Do not set `CLAUDE_CONFIG_DIR` for `default`.
+- **`~/.claude` is never pinned, however it was named.** `_caw_launch_profile_pinned`
+  returns false when the resolved dir IS `~/.claude`, not just when the spec was
+  the literal `default`. Setting `CLAUDE_CONFIG_DIR=~/.claude` looks like a no-op
+  and is not: it also relocates the GLOBAL config from `~/.claude.json` to
+  `$CLAUDE_CONFIG_DIR/.claude.json`, a file that has never been onboarded, so the
+  launch gets the first-run setup wizard instead of Claude. Three specs reach that
+  dir without being `default` — an absolute `--profile ~/.claude`, a
+  claude-profile name whose dir is `~/.claude` (the `personal` case), and an
+  inherited `CLAUDE_CONFIG_DIR`. `_caw_check_dir` is deliberately NOT guarded:
+  the usage endpoint always needs a concrete path.
 - **Single-profile behaves identically to before.** The `_caw_*_one` bodies are
   the byte-for-byte old single-profile logic; a one-profile invocation (and its
   `<hash>.state` file) is unchanged — no state-format migration. `--config-dir`
@@ -355,6 +365,19 @@ rewrites the README refs and deletes superseded files.
   fake inputs — e.g. feed `_caw_wait_reply`-style pane snapshots to the filter, or
   hand `_caw_session_active` a mocked `_caw_usage_json`. The reply-detection and
   transcript-cleanup logic are fully unit-testable this way.
+- **Profile pinning** is unit-testable the same way, and worth re-checking after
+  any change to spec resolution — pinning `~/.claude` silently swaps the session
+  for the setup wizard, which no syntax check catches:
+
+  ```zsh
+  source ./claude-auto-window
+  for spec in default "$HOME/.claude" "$HOME/.claude-work"; do
+    ( unset CLAUDE_AUTO_WINDOW_CONFIG_DIR CLAUDE_CONFIG_DIR; _caw_pin_profile "$spec"
+      _caw_launch_profile_pinned && r="pinned $(_caw_check_dir)" || r="passthrough"
+      print -r -- "$spec -> $r" )
+  done
+  # expect: default -> passthrough | ~/.claude -> passthrough | ~/.claude-work -> pinned
+  ```
 - **Live but free — the expired-token self-heal path:** temporarily set the
   stored credential's `expiresAt` into the past (keep the blob **in shell
   memory only** — never write it to a file — and mutate just the timestamp;
