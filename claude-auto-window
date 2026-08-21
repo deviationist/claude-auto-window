@@ -143,8 +143,21 @@ _caw_check_dir() {
 # Whether to pin CLAUDE_CONFIG_DIR for the launch. Only when the operator
 # explicitly selected a profile — otherwise we stay a transparent passthrough
 # and Claude Code resolves ~/.claude on its own (mirrors claude-profile.zsh).
+#
+# ...and ~/.claude counts as "no selection" however it was arrived at, because
+# naming it is not the no-op it looks like: CLAUDE_CONFIG_DIR also relocates the
+# GLOBAL config from ~/.claude.json to $CLAUDE_CONFIG_DIR/.claude.json, and that
+# second file has never been through onboarding — so pinning the default seat
+# launches the first-run setup wizard instead of Claude. Reachable three ways,
+# all of which resolve to a path rather than the `default` spec: an absolute
+# `--profile ~/.claude`, a claude-profile name whose dir IS ~/.claude (the
+# `personal` case _caw_profile_spec calls out above), and an inherited
+# CLAUDE_CONFIG_DIR. The `default` spec already unsets its way here; this makes
+# the other three arrive at the same place. (Same invariant as ccfind, which
+# shipped this bug in 2026-08 and now guards it in _ccfind_pin_cfgdir.)
 _caw_launch_profile_pinned() {
-  [[ -n "${CLAUDE_AUTO_WINDOW_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-}}" ]]
+  local dir="${CLAUDE_AUTO_WINDOW_CONFIG_DIR:-${CLAUDE_CONFIG_DIR:-}}"
+  [[ -n "$dir" && "${dir%/}" != "${HOME%/}/.claude" ]]
 }
 
 _caw_resolve_claude_bin() {
