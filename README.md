@@ -159,9 +159,11 @@ resolved from claude-profile's own config, so the two tools never disagree).
   (`claude-profile anchor-window …`). claude-auto-window invokes `claude-profile.py`
   by path (auto-discovered; override with `--claude-profile-py`), since the daemon
   runs headless where the zsh `claude-profile` function isn't sourced.
-- **Division of labor:** claude-profile's own keep-alive daemon renews *refresh
-  tokens* (week-scale); claude-auto-window anchors *5-hour windows*. Complementary,
-  not overlapping.
+- **Division of labor:** claude-auto-window anchors *5-hour windows*; it does not
+  keep *refresh tokens* alive, and nothing can. Each account's refresh-token chain
+  ends on a fixed date (about a month out), so re-run `claude-profile auth <account>`
+  before it does. `claude-profile status` shows the deadline. An account whose
+  chain has lapsed fails every anchor and trips the circuit breaker.
 - **Live-account fallback:** if the *live* account's token has lapsed, the anchor
   falls back to a `tmux` launch in the dir (which refreshes it and anchors). Parked
   accounts have no such fallback — an aged-out parked refresh token needs

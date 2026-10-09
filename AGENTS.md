@@ -246,11 +246,13 @@ functions are the `claude-auto-window*` names.
   generator captures output through a pipe. **Keep the plain-text line shape
   byte-identical** — only escapes are added, never re-ordered or re-worded
   fields, since `--status` is plausibly grepped in user scripts.
-- **Exactly one component maintains any given credential.** claude-profile's
-  keep-alive owns **parked** accounts — it alone can touch that store. The
-  **live** account it deliberately refuses (`skipped — live in profile "…"`),
-  because refresh tokens rotate on use and a second writer racing Claude Code
-  means a lost update and a dead credential. So the live account is repaired by
+- **Exactly one component maintains any given credential.** claude-profile owns
+  the **parked** store (`anchor-window`, `auth`); it alone can touch it. It no
+  longer ships a keep-alive: refresh-token chains turned out to be capped at a
+  fixed deadline, so parked accounts lapse unless they are re-authed
+  periodically with `claude-profile auth`. The **live** account it deliberately
+  leaves alone, because refresh tokens rotate on use and a second writer racing
+  Claude Code means a lost update and a dead credential. So the live account is repaired by
   claude-auto-window causing a **bare, prompt-less `claude` launch**
   (`_caw_refresh_token`) — note the writer is still Claude Code itself; this
   script never writes a credential. The two sets are disjoint by construction:
